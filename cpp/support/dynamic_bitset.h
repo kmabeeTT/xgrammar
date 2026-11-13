@@ -157,8 +157,12 @@ class DynamicBitset {
   /*! \brief Perform a bitwise OR operation between the current bitset and another bitset. */
   DynamicBitset& operator|=(const DynamicBitset& other) {
     XGRAMMAR_DCHECK(buffer_size_ <= other.buffer_size_);
-    for (int i = 0; i < buffer_size_; ++i) {
-      data_[i] |= other.data_[i];
+    // Locals: a store through data_ may alias buffer_size_, which would keep the loop scalar.
+    uint32_t* __restrict dst = data_;
+    const uint32_t* __restrict src = other.data_;
+    const int n = buffer_size_;
+    for (int i = 0; i < n; ++i) {
+      dst[i] |= src[i];
     }
     return *this;
   }
