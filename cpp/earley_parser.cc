@@ -110,6 +110,7 @@ void EarleyParser::PopLastStates(int32_t cnt) {
     XGRAMMAR_LOG(FATAL) << "The number of states to be popped is larger than the size of states.";
   }
   rule_id_to_completable_states_.PopBack(cnt);
+  min_rows_after_pop_ = std::min(min_rows_after_pop_, rule_id_to_completable_states_.size());
   is_completed_.erase(is_completed_.end() - cnt, is_completed_.end());
   scanable_state_history_.PopBack(cnt);
   if (capture_tracking_) {
@@ -395,7 +396,7 @@ void EarleyParser::Scan(const ParserState& state, const uint8_t ch) {
   \note Thus, when initializing the Earley parser, we need to add the initial state
   to the history_states[0], and perform prediction and completion on the initial state.
 */
-bool EarleyParser::Advance(const uint8_t ch, bool debug_print) {
+bool EarleyParser::AdvanceFromRow(int32_t row, const uint8_t ch, bool debug_print) {
   // Initialize the containers.
   XGRAMMAR_DCHECK(tmp_process_state_queue_.empty())
       << "The tmp_process_state_queue_ should be empty before the scan.";
@@ -407,7 +408,7 @@ bool EarleyParser::Advance(const uint8_t ch, bool debug_print) {
     tmp_char_budget_entered_ = char_budget_entry_history_.back();
     char_count_history_.push_back(GetCurrentCharIndex() + StartsUTF8Codepoint(ch));
   }
-  const auto& latest_states = scanable_state_history_[scanable_state_history_.size() - 1];
+  const auto& latest_states = scanable_state_history_[row];
   // Scan all the scanable states.
   for (const auto& state : latest_states) {
     if (skip_expired_states_ && IsExpiredState(state)) {
@@ -486,6 +487,9 @@ EarleyParser::EarleyParser(const Grammar& grammar, std::optional<ParserState> in
     if (has_budget_rules_ && has_char_budget_rules_) {
       break;
     }
+  }
+  for (int32_t i = 0; i < grammar_->NumRules(); ++i) {
+    has_lazy_rules_ = has_lazy_rules_ || grammar_->GetRule(i).is_lazy;
   }
   for (int32_t i = 0; i < grammar_->NumRules(); ++i) {
     const auto& rule = grammar_->GetRule(i);
@@ -606,6 +610,7 @@ void EarleyParser::PushStateAndExpand(const ParserState& state) {
 }
 
 void EarleyParser::Reset() {
+  min_rows_after_pop_ = 0;
   rule_id_to_completable_states_.PopBack(rule_id_to_completable_states_.size());
   scanable_state_history_.PopBack(scanable_state_history_.size());
   is_completed_.clear();
