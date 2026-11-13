@@ -972,6 +972,14 @@ class GrammarMatcher::Impl : public EarleyParser {
   /*! \brief The node reached from `node` by `byte`, or kRowCacheRejected. */
   int32_t RowCacheTransition(int32_t node, uint8_t byte);
 
+  /*! \brief Drop the cache if the history it refers to was popped, and start a new check whose
+   * first temporary row will be the next history row. */
+  void BeginRowCacheCheck();
+
+  /*! \brief Whether the bytes of `token` are accepted from the latest row and complete the
+   * grammar. */
+  bool RowCacheCompletesWith(const std::string& token);
+
   /*! \brief The uncertain-token check of FillBitmaskForStates for one state, on the row cache. */
   void CheckUncertainTokensWithRowCache(
       const ParserState& state,
@@ -1047,6 +1055,9 @@ bool GrammarMatcher::Impl::CanAcceptStopTokenAsTerminal(int32_t token_id) {
   const auto& decoded_vocab = tokenizer_info_.GetDecodedVocab();
   if (token_id >= static_cast<int32_t>(decoded_vocab.size())) {
     return false;
+  }
+  if (CanUseRowCache()) {
+    return RowCacheCompletesWith(decoded_vocab[token_id]);
   }
   // Only token edges can take a whole token; without them the atomic scan cannot advance.
   const bool atomic_success = grammar_->has_token_edges && AdvanceAtomicToken(token_id);
@@ -2348,6 +2359,39 @@ int32_t GrammarMatcher::Impl::RowCacheTransition(int32_t node, uint8_t byte) {
   return next;
 }
 
+void GrammarMatcher::Impl::BeginRowCacheCheck() {
+  if (min_rows_after_pop_ < row_cache_valid_rows_ ||
+      row_cache_nodes_.size() > kRowCacheMaxNodes || row_cache_runs_.size() > kRowCacheMaxRuns) {
+    ClearRowCache();
+  }
+  min_rows_after_pop_ = std::numeric_limits<int32_t>::max();
+  ++row_cache_check_id_;
+  row_cache_node_of_row_.clear();
+  row_cache_base_row_ = scanable_state_history_.size();
+  row_cache_valid_rows_ = row_cache_base_row_;
+}
+
+bool GrammarMatcher::Impl::RowCacheCompletesWith(const std::string& token) {
+  if (token.empty()) {
+    return false;
+  }
+  BeginRowCacheCheck();
+  const auto latest_row = scanable_state_history_[scanable_state_history_.size() - 1];
+  tmp_row_cache_states_.assign(latest_row.begin(), latest_row.end());
+  PushStatesToCheck(tmp_row_cache_states_, is_completed_.back());
+  int32_t node = InternLatestRowInRowCache();
+  for (char byte : token) {
+    node = RowCacheTransition(node, static_cast<uint8_t>(byte));
+    if (node == kRowCacheRejected) {
+      break;
+    }
+  }
+  const bool completed =
+      node != kRowCacheRejected && row_cache_keys_[row_cache_nodes_[node].key_begin + 1] != 0;
+  PopLastStates(scanable_state_history_.size() - row_cache_base_row_);
+  return completed;
+}
+
 void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
     const ParserState& state,
     const AdaptiveTokenMask& adaptive_token_mask,
@@ -2360,19 +2404,11 @@ void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
   const auto& sorted_decoded_vocab = tokenizer_info_.GetSortedDecodedVocab();
   const auto& subtree_range = tokenizer_info_.GetTrieSubtreeNodesRange();
 
-  if (min_rows_after_pop_ < row_cache_valid_rows_ ||
-      row_cache_nodes_.size() > kRowCacheMaxNodes || row_cache_runs_.size() > kRowCacheMaxRuns) {
-    ClearRowCache();
-  }
-  min_rows_after_pop_ = std::numeric_limits<int32_t>::max();
-  ++row_cache_check_id_;
-  row_cache_node_of_row_.clear();
+  BeginRowCacheCheck();
   // A node created by this check has no stored run yet, so runs are looked up, and collected,
   // only for the nodes that existed before it.
   const int32_t num_known_nodes = static_cast<int32_t>(row_cache_nodes_.size());
   PushOneStateToCheck(state);
-  row_cache_base_row_ = scanable_state_history_.size() - 1;
-  row_cache_valid_rows_ = row_cache_base_row_;
 
   // path[i] is the node after the first i bytes of the previous token.
   auto& path = tmp_row_cache_path_;
