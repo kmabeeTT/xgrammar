@@ -10,7 +10,12 @@
 #include <xgrammar/matcher.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <shared_mutex>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -508,6 +513,11 @@ class GrammarMatcher::Impl : public EarleyParser {
         !default_temperature_.has_value() ||
         (std::isfinite(default_temperature_.value()) && default_temperature_.value() >= 0)
     ) << "The default_temperature must be a finite non-negative number";
+    mask_memo_enabled_ = MaskMemoLimit() > 0 && !has_budget_rules_ && !has_char_budget_rules_ &&
+                         !capture_tracking_ && !grammar_->has_token_edges;
+    for (int32_t rule_id = 0; mask_memo_enabled_ && rule_id < grammar_->NumRules(); ++rule_id) {
+      mask_memo_enabled_ = !grammar_->GetRule(rule_id).HasRuleAttributes();
+    }
   }
 
   bool AcceptToken(int32_t token_id, bool debug_print = false);
@@ -756,6 +766,41 @@ class GrammarMatcher::Impl : public EarleyParser {
   std::string temporary_input_bytes_;
   /*! \brief Parser row immediately before temporary_input_bytes_. */
   int32_t temporary_input_start_row_ = -1;
+
+  /*! \brief The bytes all grammars' mask memos may hold together. */
+  static int64_t MaskMemoLimit() {
+    static const int64_t limit = [] {
+      const char* v = std::getenv("XGRAMMAR_MASK_MEMO_BYTES");
+      return v ? static_cast<int64_t>(std::strtoll(v, nullptr, 10)) : int64_t{256} << 20;
+    }();
+    return limit;
+  }
+
+  /*! \brief Write into mask_memo_key_ everything a fill reads: the stop policy, whether the
+   * grammar can end here, the latest scanable states, and the completable states of every input
+   * position those states can complete into, transitively. Positions are renumbered in order of
+   * first use, with the current position first, so equal parser configurations reached at
+   * different depths share a key. */
+  void BuildMaskMemoKey();
+  void InsertMaskMemo(CompiledGrammar::Impl& impl, const uint32_t* mask, size_t words);
+  /*! \brief The tokens the latest states accept without a parser check, the base a memo entry
+   * is stored against. Depends only on what the key holds. */
+  void FillMaskMemoBase(uint32_t* out, size_t words);
+  /*! \brief Add the tokens a latest state accepts without a parser check to target. */
+  void MergeAcceptedTokens(
+      const ParserState& state,
+      const AdaptiveTokenMask& adaptive_token_mask,
+      bool skip_expired,
+      DynamicBitset* target,
+      bool skip_accepted_bitset = false
+  );
+  std::vector<uint32_t> mask_memo_base_;
+  int32_t CanonicalPos(int32_t pos);
+  void AppendKeyState(const ParserState& state);
+
+  bool mask_memo_enabled_ = false;
+  std::string mask_memo_key_;
+  std::vector<int32_t> mask_memo_positions_;
 
   // Temporary data for FillNextTokenBitmask. They are stored here to avoid repeated allocation.
   DynamicBitset tmp_accepted_bitset_;
@@ -1781,8 +1826,122 @@ bool GrammarMatcher::Impl::FillNextTokenBitmask(
     budget_enforce_pending_ = false;
     budget_force_close_pending_ = false;
   }
+  if (!mask_memo_enabled_ || debug_print) {
+    FillBitmaskForStates(bitmask_data_ptr, index, /*skip_expired=*/false, debug_print);
+    return !IsTokenBitmaskAllTrue(bitmask_data_ptr);
+  }
+  BuildMaskMemoKey();
+  const size_t words = GetBitmaskSize(tokenizer_info_.GetVocabSize());
+  auto& impl = *compiled_grammar_.ImplPtr();
+  const std::vector<int32_t>* hit = nullptr;
+  {
+    std::shared_lock<std::shared_mutex> lock(impl.mask_memo_mutex);
+    auto it = impl.mask_memo.find(mask_memo_key_);
+    if (it != impl.mask_memo.end()) hit = &it->second;
+  }
+  uint32_t* out = reinterpret_cast<uint32_t*>(bitmask_data_ptr);
+  if (hit != nullptr) {
+    FillMaskMemoBase(out, words);
+    for (int32_t id : *hit) out[id >> 5] ^= uint32_t{1} << (id & 31);
+    return !IsTokenBitmaskAllTrue(bitmask_data_ptr);
+  }
   FillBitmaskForStates(bitmask_data_ptr, index, /*skip_expired=*/false, debug_print);
+  if (MaskMemoTotalBytes().load(std::memory_order_relaxed) < MaskMemoLimit()) {
+    InsertMaskMemo(impl, out, words);
+  }
   return !IsTokenBitmaskAllTrue(bitmask_data_ptr);
+}
+
+void GrammarMatcher::Impl::FillMaskMemoBase(uint32_t* out, size_t words) {
+  DynamicBitset base(tokenizer_info_.GetVocabSize(), out);
+  bool initialized = false;
+  for (const auto& state : scanable_state_history_[scanable_state_history_.size() - 1]) {
+    const AdaptiveTokenMask& mask = compiled_grammar_->GetAdaptiveTokenMask(state);
+    if (!initialized && mask.store_type == StoreType::kAcceptedBitset) {
+      std::memcpy(out, mask.accepted_bitset.GetData(), words * sizeof(uint32_t));
+      initialized = true;
+      MergeAcceptedTokens(state, mask, false, &base, /*skip_accepted_bitset=*/true);
+      continue;
+    }
+    if (!initialized) {
+      base.Reset();
+      initialized = true;
+    }
+    MergeAcceptedTokens(state, mask, false, &base);
+  }
+  if (!initialized) base.Reset();
+}
+
+void GrammarMatcher::Impl::InsertMaskMemo(
+    CompiledGrammar::Impl& impl, const uint32_t* mask, size_t words
+) {
+  mask_memo_base_.resize(words);
+  FillMaskMemoBase(mask_memo_base_.data(), words);
+  std::vector<int32_t> flips;
+  for (size_t w = 0; w < words; ++w) {
+    for (uint32_t diff = mask[w] ^ mask_memo_base_[w]; diff != 0; diff &= diff - 1) {
+      flips.push_back(static_cast<int32_t>(w * 32 + __builtin_ctz(diff)));
+    }
+  }
+  if (flips.size() > 4096) return;
+  flips.shrink_to_fit();
+  const int64_t bytes =
+      static_cast<int64_t>(mask_memo_key_.size() + flips.size() * sizeof(int32_t)) + 96;
+  std::unique_lock<std::shared_mutex> lock(impl.mask_memo_mutex);
+  if (impl.mask_memo.emplace(mask_memo_key_, std::move(flips)).second) {
+    impl.mask_memo_bytes += bytes;
+    MaskMemoTotalBytes().fetch_add(bytes, std::memory_order_relaxed);
+  }
+}
+
+int32_t GrammarMatcher::Impl::CanonicalPos(int32_t pos) {
+  if (pos == ParserState::kNoPrevInputPos) return -1;
+  for (size_t i = 0; i < mask_memo_positions_.size(); ++i) {
+    if (mask_memo_positions_[i] == pos) return static_cast<int32_t>(i);
+  }
+  mask_memo_positions_.push_back(pos);
+  return static_cast<int32_t>(mask_memo_positions_.size() - 1);
+}
+
+void GrammarMatcher::Impl::AppendKeyState(const ParserState& s) {
+  const int32_t v[] = {
+      s.rule_id,
+      s.sequence_id,
+      s.element_id,
+      CanonicalPos(s.rule_start_pos),
+      s.budget_deadline,
+      s.sub_element_id,
+      s.repeat_count,
+      s.partial_codepoint,
+      s.active_temperature_rule_id,
+      s.char_budget_deadline
+  };
+  mask_memo_key_.append(reinterpret_cast<const char*>(v), sizeof(v));
+}
+
+void GrammarMatcher::Impl::BuildMaskMemoKey() {
+  auto append = [this](int32_t v) {
+    mask_memo_key_.append(reinterpret_cast<const char*>(&v), sizeof(v));
+  };
+  mask_memo_key_.clear();
+  mask_memo_positions_.clear();
+  mask_memo_positions_.push_back(static_cast<int32_t>(rule_id_to_completable_states_.size() - 1));
+  append(terminate_without_stop_token_);
+  append(static_cast<int32_t>(stop_token_ids_.size()));
+  for (int id : stop_token_ids_) append(id);
+  const auto& latest = scanable_state_history_[scanable_state_history_.size() - 1];
+  append(latest.size());
+  append(IsCompleted());
+  for (const auto& state : latest) AppendKeyState(state);
+  for (size_t i = 0; i < mask_memo_positions_.size(); ++i) {
+    const auto& row = rule_id_to_completable_states_[mask_memo_positions_[i]];
+    append(-2 - static_cast<int32_t>(i));
+    append(row.size());
+    for (const auto& [ref_rule_id, state] : row) {
+      append(ref_rule_id);
+      AppendKeyState(state);
+    }
+  }
 }
 
 void GrammarMatcher::Impl::FillBitmaskForCharBudgetBoundary(
@@ -1938,6 +2097,73 @@ static std::optional<RepeatEdgeRef> GetRepeatEdgeInfo(
   return std::nullopt;
 }
 
+void GrammarMatcher::Impl::MergeAcceptedTokens(
+    const ParserState& state,
+    const AdaptiveTokenMask& adaptive_token_mask,
+    bool skip_expired,
+    DynamicBitset* target,
+    bool skip_accepted_bitset
+) {
+  const auto& sorted_decoded_vocab = tokenizer_info_.GetSortedDecodedVocab();
+  if (adaptive_token_mask.store_type == StoreType::kAcceptedBitset) {
+    if (!skip_accepted_bitset) *target |= adaptive_token_mask.accepted_bitset;
+  } else if (adaptive_token_mask.store_type == StoreType::kAccepted) {
+    for (auto idx : adaptive_token_mask.accepted_indices) {
+      target->Set(sorted_decoded_vocab[idx].first, true);
+    }
+  }
+  // In the body state of a counted repetition of a character class, most tokens are legal
+  // exactly when the budget left in the repetition state that predicted this body state covers
+  // the repetitions they consume, and a token that leaves the repetition also needs them to
+  // complete its lower bound (see PopulateRepeatInteriorBitsets). The compiled mask is shared by
+  // every repeat count, so the count is read from the parse history here and the matching bitset
+  // is accepted in one operation instead of replaying every such token.
+  if (!adaptive_token_mask.repeat_interior_bitsets.empty() ||
+      !adaptive_token_mask.repeat_exit_tokens.empty()) {
+    // PopulateRepeatInteriorBitsets only fills the bitsets of body rules that are entered
+    // through repeat edges alone, and none when character budgets are enforced. The mask lists
+    // none of these tokens as accepted, so without a repetition parent this state would
+    // silently reject all of them.
+    XGRAMMAR_CHECK(
+        !has_char_budget_rules_ && state.rule_start_pos != ParserState::kNoPrevInputPos
+    ) << "The counted-repetition fast path does not apply to this state";
+    int32_t remaining = -1;
+    bool on_repeat = false;
+    for (const auto& [ref_rule_id, parent_state] :
+         rule_id_to_completable_states_[state.rule_start_pos]) {
+      if (ref_rule_id != state.rule_id) {
+        continue;
+      }
+      const auto info = GetRepeatEdgeInfo(grammar_, parent_state, state.rule_id);
+      if (!info.has_value()) {
+        continue;
+      }
+      on_repeat = true;
+      // Once budgets are enforced, an expired parent scans no further byte, so the repetitions
+      // it has left cannot be used.
+      if (skip_expired && IsExpiredState(parent_state)) {
+        continue;
+      }
+      const int32_t budget = info->Upper() - parent_state.repeat_count;
+      remaining = std::max(remaining, budget);
+      for (const auto& [num_repetitions, token_id] : adaptive_token_mask.repeat_exit_tokens) {
+        if (num_repetitions <= budget &&
+            parent_state.repeat_count + num_repetitions >= info->Lower()) {
+          target->Set(token_id, true);
+        }
+      }
+    }
+    // The tokens that do not fit are rejected by this state without further work.
+    XGRAMMAR_CHECK(on_repeat) << "A counted-repetition body state has no repetition parent";
+    const auto& char_counts = adaptive_token_mask.repeat_interior_char_counts;
+    const auto it = std::upper_bound(char_counts.begin(), char_counts.end(), remaining);
+    if (it != char_counts.begin()) {
+      const size_t index = static_cast<size_t>(it - char_counts.begin()) - 1;
+      *target |= adaptive_token_mask.repeat_interior_bitsets[index];
+    }
+  }
+}
+
 void GrammarMatcher::Impl::FillBitmaskForStates(
     int32_t* bitmask_data_ptr, int index, bool skip_expired, bool debug_print
 ) {
@@ -1987,63 +2213,7 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
       }
     }
     latest_states_with_masks.emplace_back(state, adaptive_token_mask_pointer);
-    if (adaptive_token_mask.store_type == StoreType::kAcceptedBitset) {
-      tmp_accepted_bitset_ |= adaptive_token_mask.accepted_bitset;
-    } else if (adaptive_token_mask.store_type == StoreType::kAccepted) {
-      for (auto idx : adaptive_token_mask.accepted_indices) {
-        tmp_accepted_bitset_.Set(sorted_decoded_vocab[idx].first, true);
-      }
-    }
-    // In the body state of a counted repetition of a character class, most tokens are legal
-    // exactly when the budget left in the repetition state that predicted this body state covers
-    // the repetitions they consume, and a token that leaves the repetition also needs them to
-    // complete its lower bound (see PopulateRepeatInteriorBitsets). The compiled mask is shared by
-    // every repeat count, so the count is read from the parse history here and the matching bitset
-    // is accepted in one operation instead of replaying every such token.
-    if (!adaptive_token_mask.repeat_interior_bitsets.empty() ||
-        !adaptive_token_mask.repeat_exit_tokens.empty()) {
-      // PopulateRepeatInteriorBitsets only fills the bitsets of body rules that are entered
-      // through repeat edges alone, and none when character budgets are enforced. The mask lists
-      // none of these tokens as accepted, so without a repetition parent this state would
-      // silently reject all of them.
-      XGRAMMAR_CHECK(
-          !has_char_budget_rules_ && state.rule_start_pos != ParserState::kNoPrevInputPos
-      ) << "The counted-repetition fast path does not apply to this state";
-      int32_t remaining = -1;
-      bool on_repeat = false;
-      for (const auto& [ref_rule_id, parent_state] :
-           rule_id_to_completable_states_[state.rule_start_pos]) {
-        if (ref_rule_id != state.rule_id) {
-          continue;
-        }
-        const auto info = GetRepeatEdgeInfo(grammar_, parent_state, state.rule_id);
-        if (!info.has_value()) {
-          continue;
-        }
-        on_repeat = true;
-        // Once budgets are enforced, an expired parent scans no further byte, so the repetitions
-        // it has left cannot be used.
-        if (skip_expired && IsExpiredState(parent_state)) {
-          continue;
-        }
-        const int32_t budget = info->Upper() - parent_state.repeat_count;
-        remaining = std::max(remaining, budget);
-        for (const auto& [num_repetitions, token_id] : adaptive_token_mask.repeat_exit_tokens) {
-          if (num_repetitions <= budget &&
-              parent_state.repeat_count + num_repetitions >= info->Lower()) {
-            tmp_accepted_bitset_.Set(token_id, true);
-          }
-        }
-      }
-      // The tokens that do not fit are rejected by this state without further work.
-      XGRAMMAR_CHECK(on_repeat) << "A counted-repetition body state has no repetition parent";
-      const auto& char_counts = adaptive_token_mask.repeat_interior_char_counts;
-      const auto it = std::upper_bound(char_counts.begin(), char_counts.end(), remaining);
-      if (it != char_counts.begin()) {
-        const size_t index = static_cast<size_t>(it - char_counts.begin()) - 1;
-        tmp_accepted_bitset_ |= adaptive_token_mask.repeat_interior_bitsets[index];
-      }
-    }
+    MergeAcceptedTokens(state, adaptive_token_mask, skip_expired, &tmp_accepted_bitset_);
   }
 
   const auto& token_char_counts = tokenizer_info_.ImplPtr()->GetTokenCharCounts();

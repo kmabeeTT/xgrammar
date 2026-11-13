@@ -11,7 +11,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <atomic>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -139,6 +141,10 @@ XGRAMMAR_MEMBER_TABLE(
  * It is the result of preprocessing.
  * \sa xgrammar::GrammarMatcher
  */
+/*! \brief The bytes held by every grammar's token mask memo, bounded by
+ * XGRAMMAR_MASK_MEMO_BYTES (default 256 MiB; 0 turns the memo off). */
+std::atomic<int64_t>& MaskMemoTotalBytes();
+
 class CompiledGrammar::Impl {
  public:
   /*! \brief The grammar for the GrammarMatcher. */
@@ -156,6 +162,17 @@ class CompiledGrammar::Impl {
 
   /*! \brief Protects on-demand token mask cache insertion and cache serialization. */
   mutable std::mutex adaptive_token_mask_cache_mutex;
+
+  /*! \brief Filled token bitmasks keyed by the matcher's canonical parser state. An entry is
+   * immutable and lives as long as the grammar, so a reader may use it after unlocking. */
+  /*! \brief For each memoized parser state, the token ids where its mask differs from the
+   * union of its latest states' accepted tokens (GrammarMatcher::Impl::FillMaskMemoBase). */
+  std::unordered_map<std::string, std::vector<int32_t>> mask_memo;
+  mutable std::shared_mutex mask_memo_mutex;
+  /*! \brief This grammar's share of MaskMemoTotalBytes(), returned when it is destroyed. */
+  int64_t mask_memo_bytes = 0;
+
+  ~Impl() { MaskMemoTotalBytes().fetch_sub(mask_memo_bytes, std::memory_order_relaxed); }
 
   /*! \brief Whether missing token mask cache entries should be generated on demand. */
   bool enable_dynamic_compilation{false};

@@ -1029,6 +1029,11 @@ AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_
   }
 }
 
+std::atomic<int64_t>& MaskMemoTotalBytes() {
+  static std::atomic<int64_t> total{0};
+  return total;
+}
+
 const AdaptiveTokenMask& CompiledGrammar::Impl::GetAdaptiveTokenMask(const ParserState& state) {
   if (!enable_dynamic_compilation) {
     auto iterator = adaptive_token_mask_cache.find(state);

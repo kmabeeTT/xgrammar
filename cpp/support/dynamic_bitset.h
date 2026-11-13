@@ -135,6 +135,9 @@ class DynamicBitset {
     std::memset(data_, 0xFF, buffer_size_ * sizeof(uint32_t));
   }
 
+  /*! \brief The underlying words. */
+  const uint32_t* GetData() const { return data_; }
+
   /*! \brief Set the bit at the given index to the given value. */
   void Set(int index, bool value = true) {
     XGRAMMAR_DCHECK(data_ && index >= 0 && index < size_);
