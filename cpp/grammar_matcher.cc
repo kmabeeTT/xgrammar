@@ -877,6 +877,73 @@ class GrammarMatcher::Impl : public EarleyParser {
   std::vector<ParserState> tmp_row_cache_states_;
   std::vector<std::pair<int32_t, ParserState>> tmp_row_cache_completable_;
 
+  /*!
+   * \brief The result of the check for the uncertain tokens that share a prefix, from the node
+   * reached by that prefix. The tokens are uncertain_indices[list_begin, list_end) of `mask`, and
+   * share their first prefix_size bytes.
+   */
+  struct RowCacheRun {
+    int32_t node;
+    int32_t list_begin;
+    int32_t prefix_size;
+    const AdaptiveTokenMask* mask;
+    int32_t list_end;
+    /*! \brief The accepted token ids: a span of row_cache_run_accepted_. */
+    int32_t accepted_begin;
+    int32_t accepted_size;
+    int32_t next_with_same_hash;
+  };
+
+  /*! \brief A run whose result is being collected by the running check. */
+  struct RowCacheOpenRun {
+    int32_t node;
+    int32_t list_begin;
+    int32_t prefix_size;
+    int32_t list_end;
+    /*! \brief Where the run's accepted token ids start in tmp_row_cache_accepted_. */
+    int32_t accepted_begin;
+    /*! \brief False once a token of the run was skipped without being checked. */
+    bool complete;
+  };
+
+  static constexpr size_t kRowCacheMaxRuns = 1 << 16;
+
+  std::vector<RowCacheRun> row_cache_runs_;
+  std::vector<int32_t> row_cache_run_accepted_;
+  FlatUInt64Map row_cache_run_by_hash_;
+  std::vector<RowCacheOpenRun> tmp_row_cache_open_runs_;
+  std::vector<int32_t> tmp_row_cache_accepted_;
+
+  static uint64_t RowCacheRunHash(
+      int32_t node, int32_t list_begin, int32_t prefix_size, const AdaptiveTokenMask* mask
+  ) {
+    uint64_t hash = (static_cast<uint64_t>(static_cast<uint32_t>(node)) << 32) |
+                    static_cast<uint32_t>(list_begin);
+    hash = (hash ^ (hash >> 31)) * 0xFF51AFD7ED558CCDull;
+    hash ^= reinterpret_cast<uintptr_t>(mask) + static_cast<uint32_t>(prefix_size);
+    hash = (hash ^ (hash >> 29)) * 0x9E3779B97F4A7C15ull;
+    return hash & ~(static_cast<uint64_t>(1) << 63);
+  }
+
+  const RowCacheRun* FindRowCacheRun(
+      int32_t node, int32_t list_begin, int32_t prefix_size, const AdaptiveTokenMask* mask
+  ) {
+    const int32_t* first_run =
+        row_cache_run_by_hash_.Find(RowCacheRunHash(node, list_begin, prefix_size, mask));
+    for (int32_t run = first_run == nullptr ? -1 : *first_run; run != -1;
+         run = row_cache_runs_[run].next_with_same_hash) {
+      const auto& candidate = row_cache_runs_[run];
+      if (candidate.node == node && candidate.list_begin == list_begin &&
+          candidate.prefix_size == prefix_size && candidate.mask == mask) {
+        return &candidate;
+      }
+    }
+    return nullptr;
+  }
+
+  /*! \brief Store the finished open runs that end at or before uncertain-list position `pos`. */
+  void CloseRowCacheRuns(int32_t pos, const AdaptiveTokenMask* mask);
+
   /*! \brief Whether rows of this grammar depend on nothing but the parser history. */
   bool CanUseRowCache() const {
     return !has_budget_rules_ && !has_char_budget_rules_ && !capture_tracking_ &&
@@ -2094,6 +2161,43 @@ void GrammarMatcher::Impl::ClearRowCache() {
   row_cache_keys_.clear();
   row_cache_node_by_hash_.Clear();
   row_cache_transitions_.Clear();
+  row_cache_runs_.clear();
+  row_cache_run_accepted_.clear();
+  row_cache_run_by_hash_.Clear();
+}
+
+void GrammarMatcher::Impl::CloseRowCacheRuns(int32_t pos, const AdaptiveTokenMask* mask) {
+  auto& open_runs = tmp_row_cache_open_runs_;
+  while (!open_runs.empty() && open_runs.back().list_end <= pos) {
+    const auto& open_run = open_runs.back();
+    if (open_run.complete) {
+      const uint64_t hash =
+          RowCacheRunHash(open_run.node, open_run.list_begin, open_run.prefix_size, mask);
+      int32_t* first_run = row_cache_run_by_hash_.Find(hash);
+      const int32_t run = static_cast<int32_t>(row_cache_runs_.size());
+      row_cache_runs_.push_back(
+          {open_run.node,
+           open_run.list_begin,
+           open_run.prefix_size,
+           mask,
+           open_run.list_end,
+           static_cast<int32_t>(row_cache_run_accepted_.size()),
+           static_cast<int32_t>(tmp_row_cache_accepted_.size()) - open_run.accepted_begin,
+           first_run == nullptr ? -1 : *first_run}
+      );
+      row_cache_run_accepted_.insert(
+          row_cache_run_accepted_.end(),
+          tmp_row_cache_accepted_.begin() + open_run.accepted_begin,
+          tmp_row_cache_accepted_.end()
+      );
+      if (first_run == nullptr) {
+        row_cache_run_by_hash_.Insert(hash, run);
+      } else {
+        *first_run = run;
+      }
+    }
+    open_runs.pop_back();
+  }
 }
 
 int32_t GrammarMatcher::Impl::InternLatestRowInRowCache() {
@@ -2257,12 +2361,15 @@ void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
   const auto& subtree_range = tokenizer_info_.GetTrieSubtreeNodesRange();
 
   if (min_rows_after_pop_ < row_cache_valid_rows_ ||
-      row_cache_nodes_.size() > kRowCacheMaxNodes) {
+      row_cache_nodes_.size() > kRowCacheMaxNodes || row_cache_runs_.size() > kRowCacheMaxRuns) {
     ClearRowCache();
   }
   min_rows_after_pop_ = std::numeric_limits<int32_t>::max();
   ++row_cache_check_id_;
   row_cache_node_of_row_.clear();
+  // A node created by this check has no stored run yet, so runs are looked up, and collected,
+  // only for the nodes that existed before it.
+  const int32_t num_known_nodes = static_cast<int32_t>(row_cache_nodes_.size());
   PushOneStateToCheck(state);
   row_cache_base_row_ = scanable_state_history_.size() - 1;
   row_cache_valid_rows_ = row_cache_base_row_;
@@ -2275,12 +2382,43 @@ void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
   path[0] = InternLatestRowInRowCache();
 
   const bool store_rejected = adaptive_token_mask.store_type == StoreType::kRejected;
+  const int32_t list_size = static_cast<int32_t>(uncertain_indices.size());
+  auto& open_runs = tmp_row_cache_open_runs_;
+  auto& run_accepted = tmp_row_cache_accepted_;
+  open_runs.clear();
+  run_accepted.clear();
+  auto apply_run = [&](const RowCacheRun& run) {
+    const int32_t* accepted_ids = row_cache_run_accepted_.data() + run.accepted_begin;
+    for (int32_t i = 0; i < run.accepted_size; ++i) {
+      accepted_bitset->Set(accepted_ids[i], true);
+    }
+    if (!open_runs.empty()) {
+      run_accepted.insert(run_accepted.end(), accepted_ids, accepted_ids + run.accepted_size);
+    }
+  };
+
+  if (!store_rejected && path[0] < num_known_nodes) {
+    if (const RowCacheRun* run = FindRowCacheRun(path[0], 0, 0, &adaptive_token_mask)) {
+      apply_run(*run);
+      PopLastStates(scanable_state_history_.size() - row_cache_base_row_);
+      return;
+    }
+    open_runs.push_back({path[0], 0, 0, list_size, 0, true});
+  }
+
   const std::string* prev_token = nullptr;
   int prev_matched_size = 0;
   int last_rejected_uncertain_range = 0;
   for (auto token_it = uncertain_indices.begin(); token_it != uncertain_indices.end();) {
+    const int32_t list_pos = static_cast<int32_t>(token_it - uncertain_indices.begin());
+    if (!open_runs.empty()) {
+      CloseRowCacheRuns(list_pos, &adaptive_token_mask);
+    }
     const auto cur_token_idx = *token_it++;
     if ((*accepted_bitset)[sorted_decoded_vocab[cur_token_idx].first]) {
+      for (auto& open_run : open_runs) {
+        open_run.complete = false;
+      }
       continue;
     }
     // The token is in the subtree of a rejected token.
@@ -2311,6 +2449,7 @@ void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
       }
       prev_matched_size = std::min(prev_matched_size, lcp_len);
     }
+    bool applied_run = false;
     if (accepted) {
       if (path.size() <= cur_token.size()) {
         path.resize(cur_token.size() + 1);
@@ -2324,7 +2463,38 @@ void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
         }
         path[j + 1] = next;
         prev_matched_size = j + 1;
+        if (store_rejected || next >= num_known_nodes) {
+          continue;
+        }
+        // The uncertain tokens from this one on that share the first j + 1 bytes are a run.
+        if (const RowCacheRun* run =
+                FindRowCacheRun(next, list_pos, j + 1, &adaptive_token_mask)) {
+          apply_run(*run);
+          token_it = uncertain_indices.begin() + run->list_end;
+          applied_run = true;
+          break;
+        }
+        auto run_end = token_it;
+        for (; run_end != uncertain_indices.end(); ++run_end) {
+          const auto& token = sorted_decoded_vocab[*run_end].second;
+          if (static_cast<int>(token.size()) <= j ||
+              std::memcmp(token.data(), cur_token.data(), j + 1) != 0) {
+            break;
+          }
+        }
+        open_runs.push_back(
+            {next,
+             list_pos,
+             j + 1,
+             static_cast<int32_t>(run_end - uncertain_indices.begin()),
+             static_cast<int32_t>(run_accepted.size()),
+             true}
+        );
       }
+    }
+    prev_token = &cur_token;
+    if (applied_run) {
+      continue;
     }
 
     if (store_rejected) {
@@ -2333,9 +2503,12 @@ void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
       }
     } else if (accepted) {
       accepted_bitset->Set(sorted_decoded_vocab[cur_token_idx].first, true);
+      if (!open_runs.empty()) {
+        run_accepted.push_back(sorted_decoded_vocab[cur_token_idx].first);
+      }
     }
-    prev_token = &cur_token;
   }
+  CloseRowCacheRuns(list_size, &adaptive_token_mask);
 
   PopLastStates(scanable_state_history_.size() - row_cache_base_row_);
 }
