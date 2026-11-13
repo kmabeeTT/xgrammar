@@ -391,7 +391,7 @@ void EarleyParser::Scan(const ParserState& state, const uint8_t ch) {
   \note Thus, when initializing the Earley parser, we need to add the initial state
   to the history_states[0], and perform prediction and completion on the initial state.
 */
-bool EarleyParser::Advance(const uint8_t ch, bool debug_print) {
+bool EarleyParser::AdvanceFromRow(int32_t row, const uint8_t ch, bool debug_print) {
   // Initialize the containers.
   XGRAMMAR_DCHECK(tmp_process_state_queue_.empty())
       << "The tmp_process_state_queue_ should be empty before the scan.";
@@ -403,7 +403,7 @@ bool EarleyParser::Advance(const uint8_t ch, bool debug_print) {
     tmp_char_budget_entered_ = char_budget_entry_history_.back();
     char_count_history_.push_back(GetCurrentCharIndex() + StartsUTF8Codepoint(ch));
   }
-  const auto& latest_states = scanable_state_history_[scanable_state_history_.size() - 1];
+  const auto& latest_states = scanable_state_history_[row];
   // Scan all the scanable states.
   for (const auto& state : latest_states) {
     if (skip_expired_states_ && IsExpiredState(state)) {
@@ -475,9 +475,7 @@ EarleyParser::EarleyParser(const Grammar& grammar, std::optional<ParserState> in
   for (int32_t i = 0; i < grammar_->NumRules(); ++i) {
     has_budget_rules_ = has_budget_rules_ || grammar_->GetRule(i).max_tokens >= 0;
     has_char_budget_rules_ = has_char_budget_rules_ || grammar_->GetRule(i).max_chars >= 0;
-    if (has_budget_rules_ && has_char_budget_rules_) {
-      break;
-    }
+    has_lazy_rules_ = has_lazy_rules_ || grammar_->GetRule(i).is_lazy;
   }
   for (int32_t i = 0; i < grammar_->NumRules(); ++i) {
     const auto& rule = grammar_->GetRule(i);
