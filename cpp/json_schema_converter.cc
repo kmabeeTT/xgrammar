@@ -33,6 +33,7 @@
 #include "grammar_functor.h"
 #include "json_schema_converter_ext.h"
 #include "regex_converter.h"
+#include "support/encoding.h"
 #include "support/json_parse.h"
 #include "support/logging.h"
 
@@ -2349,6 +2350,32 @@ int32_t JSONSchemaConverter::GenerateFromSpec(
 }
 
 /*!
+ * \brief Whether a match of the regex can contain a character that must be escaped inside a JSON
+ * string literal. Also true when the FSM regex engine does not support the regex.
+ */
+static bool MatchesJSONEscapedCharacter(const std::string& regex) {
+  auto fsm_result = GrammarFSMBuilder::Regex(regex, false);
+  if (fsm_result.IsErr()) {
+    return true;
+  }
+  const auto fsm = std::move(fsm_result).Unwrap();
+  const auto& forbidden_chars = GrammarFSMBuilder::JSONStringForbiddenChars();
+  for (int state = 0; state < fsm.NumStates(); ++state) {
+    for (const auto& edge : fsm.GetFsm().GetEdges(state)) {
+      if (!edge.IsCharRange()) {
+        continue;
+      }
+      for (int byte = edge.min; byte <= std::min<int>(edge.max, 0xFF); ++byte) {
+        if (forbidden_chars[byte]) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/*!
  * \brief Emit the grammar expression matching a regex. Prefer the Regex node with
  * json_string=true so the pattern is compiled into a single automaton by GrammarFSMBuilder;
  * json_string=true excludes the characters that must be escaped in a JSON string ('"', '\\'
@@ -2362,10 +2389,17 @@ int32_t JSONSchemaConverter::RegexExpression(
 ) {
   bool can_use_fsm = !force_cfg_expansion;
   if (json_string) {
-    can_use_fsm =
-        can_use_fsm && std::all_of(regex.begin(), regex.end(), [](unsigned char character) {
+    const bool printable_ascii =
+        std::all_of(regex.begin(), regex.end(), [](unsigned char character) {
           return character >= 0x20 && character <= 0x7e;
         });
+    // The CFG expansion of any other pattern lets its character matches take the characters
+    // that a JSON string must escape. The automaton excludes them, so it replaces the expansion
+    // only for a pattern that never matches one: both then accept the same language.
+    if (!printable_ascii) {
+      can_use_fsm = can_use_fsm && ValidUTF8PrefixLength(regex) == regex.size() &&
+                    !MatchesJSONEscapedCharacter(regex);
+    }
   }
   if (can_use_fsm) {
     auto fsm_result = GrammarFSMBuilder::Regex(regex, json_string);
