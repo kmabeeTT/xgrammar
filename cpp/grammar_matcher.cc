@@ -2482,8 +2482,7 @@ void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
   const auto& subtree_range = tokenizer_info_.GetTrieSubtreeNodesRange();
 
   BeginRowCacheCheck();
-  // A node created by this check has no stored run yet, so runs are looked up, and collected,
-  // only for the nodes that existed before it.
+  // A node created by this check has no stored run yet.
   const int32_t num_known_nodes = static_cast<int32_t>(row_cache_nodes_.size());
   PushOneStateToCheck(state);
 
@@ -2510,11 +2509,14 @@ void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
     }
   };
 
-  if (!store_rejected && path[0] < num_known_nodes && list_size >= kRowCacheMinRunTokens) {
-    if (const RowCacheRun* run = FindRowCacheRun(path[0], 0, 0, &adaptive_token_mask)) {
-      apply_run(*run);
-      PopLastStates(scanable_state_history_.size() - row_cache_base_row_);
-      return;
+  // The whole list is a run from the node of the state itself.
+  if (!store_rejected && list_size >= kRowCacheMinRunTokens) {
+    if (path[0] < num_known_nodes) {
+      if (const RowCacheRun* run = FindRowCacheRun(path[0], 0, 0, &adaptive_token_mask)) {
+        apply_run(*run);
+        PopLastStates(scanable_state_history_.size() - row_cache_base_row_);
+        return;
+      }
     }
     open_runs.push_back({path[0], 0, 0, list_size, 0, true});
   }
@@ -2576,7 +2578,9 @@ void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
         }
         path[j + 1] = next;
         prev_matched_size = j + 1;
-        if (store_rejected || next >= num_known_nodes) {
+        // A run is looked up, and collected, only where the path enters the nodes that existed
+        // before this check: the runs below it are covered by it.
+        if (store_rejected || next >= num_known_nodes || path[j] < num_known_nodes) {
           continue;
         }
         // The uncertain tokens from this one on that share the first j + 1 bytes are a run. The
