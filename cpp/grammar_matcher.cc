@@ -39,6 +39,12 @@
 #include "testing.h"
 #include "tokenizer_info_impl.h"
 
+static std::atomic<uint64_t> mask_memo_entries{0};
+extern "C" void xgr_mask_memo_stats(uint64_t* entries, uint64_t* bytes) {
+  *entries = mask_memo_entries.load();
+  *bytes = static_cast<uint64_t>(xgrammar::MaskMemoTotalBytes().load());
+}
+
 namespace xgrammar {
 
 /******************* Tool functions for token mask *******************/
@@ -1889,6 +1895,7 @@ void GrammarMatcher::Impl::InsertMaskMemo(
       static_cast<int64_t>(mask_memo_key_.size() + flips.size() * sizeof(int32_t)) + 96;
   std::unique_lock<std::shared_mutex> lock(impl.mask_memo_mutex);
   if (impl.mask_memo.emplace(mask_memo_key_, std::move(flips)).second) {
+    mask_memo_entries.fetch_add(1, std::memory_order_relaxed);
     impl.mask_memo_bytes += bytes;
     MaskMemoTotalBytes().fetch_add(bytes, std::memory_order_relaxed);
   }
