@@ -907,6 +907,7 @@ class GrammarMatcher::Impl : public EarleyParser {
   };
 
   static constexpr size_t kRowCacheMaxRuns = 1 << 16;
+  static constexpr int32_t kRowCacheMinRunTokens = 3;
 
   std::vector<RowCacheRun> row_cache_runs_;
   std::vector<int32_t> row_cache_run_accepted_;
@@ -2297,7 +2298,7 @@ int32_t GrammarMatcher::Impl::RowCacheHistoryRow(int32_t node) {
   // The rows this one refers to come first: they were created earlier, so this terminates.
   auto ensure_referenced_row = [&](const int32_t* state_ints) {
     ParserState state;
-    std::memcpy(&state, state_ints, sizeof(ParserState));
+    std::memcpy(static_cast<void*>(&state), state_ints, sizeof(ParserState));
     if (state.rule_start_pos <= kRowCacheFirstNodeRef) {
       RowCacheHistoryRow(kRowCacheFirstNodeRef - state.rule_start_pos);
     }
@@ -2314,7 +2315,7 @@ int32_t GrammarMatcher::Impl::RowCacheHistoryRow(int32_t node) {
   const int32_t row = scanable_state_history_.size();
   auto restore_state = [&](const int32_t* state_ints) {
     ParserState state;
-    std::memcpy(&state, state_ints, sizeof(ParserState));
+    std::memcpy(static_cast<void*>(&state), state_ints, sizeof(ParserState));
     if (state.rule_start_pos == kRowCacheSelf) {
       state.rule_start_pos = row;
     } else if (state.rule_start_pos <= kRowCacheFirstNodeRef) {
@@ -2433,7 +2434,7 @@ void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
     }
   };
 
-  if (!store_rejected && path[0] < num_known_nodes) {
+  if (!store_rejected && path[0] < num_known_nodes && list_size >= kRowCacheMinRunTokens) {
     if (const RowCacheRun* run = FindRowCacheRun(path[0], 0, 0, &adaptive_token_mask)) {
       apply_run(*run);
       PopLastStates(scanable_state_history_.size() - row_cache_base_row_);
@@ -2502,7 +2503,18 @@ void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
         if (store_rejected || next >= num_known_nodes) {
           continue;
         }
-        // The uncertain tokens from this one on that share the first j + 1 bytes are a run.
+        // The uncertain tokens from this one on that share the first j + 1 bytes are a run. The
+        // list is sorted, so the run has kRowCacheMinRunTokens tokens if the last of them shares
+        // the prefix. A shorter run costs less to check than to store.
+        if (uncertain_indices.end() - token_it < kRowCacheMinRunTokens - 1) {
+          continue;
+        }
+        const auto& last_of_min_run =
+            sorted_decoded_vocab[*(token_it + (kRowCacheMinRunTokens - 2))].second;
+        if (static_cast<int>(last_of_min_run.size()) <= j ||
+            std::memcmp(last_of_min_run.data(), cur_token.data(), j + 1) != 0) {
+          continue;
+        }
         if (const RowCacheRun* run =
                 FindRowCacheRun(next, list_pos, j + 1, &adaptive_token_mask)) {
           apply_run(*run);
