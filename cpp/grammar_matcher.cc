@@ -891,6 +891,10 @@ class GrammarMatcher::Impl : public EarleyParser {
    * first temporary row will be the next history row. */
   void BeginRowCacheCheck();
 
+  /*! \brief Whether the bytes of `token` are accepted from the latest row and complete the
+   * grammar. */
+  bool RowCacheCompletesWith(const std::string& token);
+
   /*! \brief The uncertain-token check of FillBitmaskForStates for one state, on the row cache. */
   void CheckUncertainTokensWithRowCache(
       const ParserState& state,
@@ -966,6 +970,17 @@ bool GrammarMatcher::Impl::CanAcceptStopTokenAsTerminal(int32_t token_id) {
   const auto& decoded_vocab = tokenizer_info_.GetDecodedVocab();
   if (token_id >= static_cast<int32_t>(decoded_vocab.size())) {
     return false;
+  }
+  if (CanUseRowCache()) {
+    // Most rows reject the first byte, which one Advance finds out for less than a cache check
+    // costs. Inside a string every byte is accepted, and the cache has the rest of the walk.
+    const auto& stop_token = decoded_vocab[token_id];
+    if (stop_token.empty() || !Advance(static_cast<uint8_t>(stop_token[0]))) {
+      return false;
+    }
+    const bool completed = is_completed_.back();
+    PopLastStates(1);
+    return stop_token.size() == 1 ? completed : RowCacheCompletesWith(stop_token);
   }
   // Only token edges can take a whole token; without them the atomic scan cannot advance.
   const bool atomic_success = grammar_->has_token_edges && AdvanceAtomicToken(token_id);
@@ -2349,6 +2364,24 @@ int32_t GrammarMatcher::Impl::RowCacheContextHistoryRow(int32_t context) {
     XGRAMMAR_CHECK(row >= 0) << "No committed row holds the row cache context " << context;
   }
   return row;
+}
+
+bool GrammarMatcher::Impl::RowCacheCompletesWith(const std::string& token) {
+  BeginRowCacheCheck();
+  const auto latest_row = scanable_state_history_[scanable_state_history_.size() - 1];
+  tmp_row_cache_states_.assign(latest_row.begin(), latest_row.end());
+  PushStatesToCheck(tmp_row_cache_states_, is_completed_.back());
+  int32_t node = InternLatestRowInRowCache();
+  for (char byte : token) {
+    node = RowCacheTransition(node, static_cast<uint8_t>(byte));
+    if (node == kRowCacheRejected) {
+      break;
+    }
+  }
+  const bool completed =
+      node != kRowCacheRejected && row_cache_.node_keys[row_cache_.nodes[node].key_begin + 1] != 0;
+  PopLastStates(scanable_state_history_.size() - row_cache_base_row_);
+  return completed;
 }
 
 void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
