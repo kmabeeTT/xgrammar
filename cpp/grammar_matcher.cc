@@ -27,6 +27,7 @@
 #include "compiled_grammar_impl.h"
 #include "earley_parser.h"
 #include "grammar_impl.h"
+#include "row_cache.h"
 #include "support/dynamic_bitset.h"
 #include "support/encoding.h"
 #include "support/int_set.h"
@@ -464,76 +465,6 @@ void ApplyTokenBitmaskInplaceCPU(
  * process.
  */
 
-/*! \brief Open-addressing map from uint64_t keys to int32_t values. The all-ones key is reserved. */
-class FlatUInt64Map {
- public:
-  int32_t* Find(uint64_t key) {
-    if (keys_.empty()) {
-      return nullptr;
-    }
-    for (size_t slot = Mix(key) & mask_;; slot = (slot + 1) & mask_) {
-      if (keys_[slot] == key) {
-        return &values_[slot];
-      }
-      if (keys_[slot] == kEmpty) {
-        return nullptr;
-      }
-    }
-  }
-
-  /*! \brief Insert a key that is not in the map. */
-  void Insert(uint64_t key, int32_t value) {
-    if ((size_ + 1) * 2 > keys_.size()) {
-      Grow();
-    }
-    InsertNoGrow(key, value);
-    ++size_;
-  }
-
-  void Clear() {
-    keys_.clear();
-    values_.clear();
-    size_ = 0;
-    mask_ = 0;
-  }
-
- private:
-  static constexpr uint64_t kEmpty = ~static_cast<uint64_t>(0);
-
-  static size_t Mix(uint64_t key) {
-    key *= 0x9E3779B97F4A7C15ull;
-    return static_cast<size_t>(key ^ (key >> 29));
-  }
-
-  void InsertNoGrow(uint64_t key, int32_t value) {
-    size_t slot = Mix(key) & mask_;
-    while (keys_[slot] != kEmpty) {
-      slot = (slot + 1) & mask_;
-    }
-    keys_[slot] = key;
-    values_[slot] = value;
-  }
-
-  void Grow() {
-    std::vector<uint64_t> old_keys = std::move(keys_);
-    std::vector<int32_t> old_values = std::move(values_);
-    const size_t capacity = old_keys.empty() ? 64 : old_keys.size() * 2;
-    keys_.assign(capacity, kEmpty);
-    values_.assign(capacity, 0);
-    mask_ = capacity - 1;
-    for (size_t i = 0; i < old_keys.size(); ++i) {
-      if (old_keys[i] != kEmpty) {
-        InsertNoGrow(old_keys[i], old_values[i]);
-      }
-    }
-  }
-
-  std::vector<uint64_t> keys_;
-  std::vector<int32_t> values_;
-  size_t size_ = 0;
-  size_t mask_ = 0;
-};
-
 /* \brief The concrete implementation of GrammarMatcherNode. */
 class GrammarMatcher::Impl : public EarleyParser {
  public:
@@ -579,7 +510,14 @@ class GrammarMatcher::Impl : public EarleyParser {
         !default_temperature_.has_value() ||
         (std::isfinite(default_temperature_.value()) && default_temperature_.value() >= 0)
     ) << "The default_temperature must be a finite non-negative number";
+    if (CanUseRowCache()) {
+      row_cache_ = compiled_grammar_->TakeRowCache();
+    }
   }
+
+  Impl(const Impl&) = default;
+
+  ~Impl() { compiled_grammar_->ReturnRowCache(std::move(row_cache_)); }
 
   bool AcceptToken(int32_t token_id, bool debug_print = false);
 
@@ -843,42 +781,16 @@ class GrammarMatcher::Impl : public EarleyParser {
    * becomes kRowCacheSelf, and the position of another temporary row becomes a reference to that
    * row's cache node. Rows with equal stored forms accept the same byte strings, so the byte
    * transitions between nodes are computed once, also when the same structure is entered again
-   * at another place of the input.
+   * at another place of the input, or by another matcher of the same compiled grammar: the
+   * store is taken from the compiled grammar's pool and returned to it when the matcher ends.
    */
-  struct RowCacheNode {
-    /*! \brief The stored form: a span of row_cache_keys_. */
-    int32_t key_begin;
-    int32_t key_size;
-    /*! \brief The next node with the same hash, or -1. */
-    int32_t next_with_same_hash;
-    /*! \brief A history row holding this node's states during check row_cache_check_id_. */
-    int32_t history_row;
-    uint32_t history_row_check_id;
-  };
+  RowCacheStore row_cache_;
 
   static constexpr int32_t kRowCacheSelf = -2;
   static constexpr int32_t kRowCacheFirstNodeRef = -3;
   static constexpr int32_t kRowCacheRejected = -1;
   static constexpr size_t kRowCacheMaxNodes = 1 << 14;
 
-  std::vector<RowCacheNode> row_cache_nodes_;
-  std::vector<int32_t> row_cache_keys_;
-  /*! \brief Hash of a stored form -> the first node with that hash. */
-  FlatUInt64Map row_cache_node_by_hash_;
-  /*! \brief (node << 8 | byte) -> the node after the byte, or kRowCacheRejected. */
-  FlatUInt64Map row_cache_transitions_;
-  /*! \brief The content of a committed rule_id_to_completable_states_ row, positions replaced
-   * as in a node. */
-  struct RowCacheContext {
-    int32_t key_begin;
-    int32_t key_size;
-    int32_t next_with_same_hash;
-    /*! \brief A committed row that had this content when it was last seen. */
-    int32_t history_row;
-  };
-  std::vector<RowCacheContext> row_cache_contexts_;
-  std::vector<int32_t> row_cache_context_keys_;
-  FlatUInt64Map row_cache_context_by_hash_;
   /*! \brief The context of each committed history row the cache has seen. */
   std::vector<int32_t> row_cache_context_of_row_;
 
@@ -889,30 +801,12 @@ class GrammarMatcher::Impl : public EarleyParser {
   int32_t RowCacheContextHistoryRow(int32_t context);
   /*! \brief The first temporary history row of the running check. */
   int32_t row_cache_base_row_ = 0;
-  uint32_t row_cache_check_id_ = 0;
   /*! \brief The node held by each temporary history row of the running check. */
   std::vector<int32_t> row_cache_node_of_row_;
   std::vector<int32_t> tmp_row_cache_key_;
   std::vector<int32_t> tmp_row_cache_path_;
   std::vector<ParserState> tmp_row_cache_states_;
   std::vector<std::pair<int32_t, ParserState>> tmp_row_cache_completable_;
-
-  /*!
-   * \brief The result of the check for the uncertain tokens that share a prefix, from the node
-   * reached by that prefix. The tokens are uncertain_indices[list_begin, list_end) of `mask`, and
-   * share their first prefix_size bytes.
-   */
-  struct RowCacheRun {
-    int32_t node;
-    int32_t list_begin;
-    int32_t prefix_size;
-    const AdaptiveTokenMask* mask;
-    int32_t list_end;
-    /*! \brief The accepted token ids: a span of row_cache_run_accepted_. */
-    int32_t accepted_begin;
-    int32_t accepted_size;
-    int32_t next_with_same_hash;
-  };
 
   /*! \brief A run whose result is being collected by the running check. */
   struct RowCacheOpenRun {
@@ -929,9 +823,6 @@ class GrammarMatcher::Impl : public EarleyParser {
   static constexpr size_t kRowCacheMaxRuns = 1 << 16;
   static constexpr int32_t kRowCacheMinRunTokens = 3;
 
-  std::vector<RowCacheRun> row_cache_runs_;
-  std::vector<int32_t> row_cache_run_accepted_;
-  FlatUInt64Map row_cache_run_by_hash_;
   std::vector<RowCacheOpenRun> tmp_row_cache_open_runs_;
   std::vector<int32_t> tmp_row_cache_accepted_;
 
@@ -950,10 +841,10 @@ class GrammarMatcher::Impl : public EarleyParser {
       int32_t node, int32_t list_begin, int32_t prefix_size, const AdaptiveTokenMask* mask
   ) {
     const int32_t* first_run =
-        row_cache_run_by_hash_.Find(RowCacheRunHash(node, list_begin, prefix_size, mask));
+        row_cache_.run_by_hash.Find(RowCacheRunHash(node, list_begin, prefix_size, mask));
     for (int32_t run = first_run == nullptr ? -1 : *first_run; run != -1;
-         run = row_cache_runs_[run].next_with_same_hash) {
-      const auto& candidate = row_cache_runs_[run];
+         run = row_cache_.runs[run].next_with_same_hash) {
+      const auto& candidate = row_cache_.runs[run];
       if (candidate.node == node && candidate.list_begin == list_begin &&
           candidate.prefix_size == prefix_size && candidate.mask == mask) {
         return &candidate;
@@ -2185,16 +2076,7 @@ static std::optional<RepeatEdgeRef> GetRepeatEdgeInfo(
 }
 
 void GrammarMatcher::Impl::ClearRowCache() {
-  row_cache_nodes_.clear();
-  row_cache_keys_.clear();
-  row_cache_node_by_hash_.Clear();
-  row_cache_transitions_.Clear();
-  row_cache_runs_.clear();
-  row_cache_run_accepted_.clear();
-  row_cache_run_by_hash_.Clear();
-  row_cache_contexts_.clear();
-  row_cache_context_keys_.clear();
-  row_cache_context_by_hash_.Clear();
+  row_cache_.Clear();
   row_cache_context_of_row_.clear();
 }
 
@@ -2205,25 +2087,25 @@ void GrammarMatcher::Impl::CloseRowCacheRuns(int32_t pos, const AdaptiveTokenMas
     if (open_run.complete) {
       const uint64_t hash =
           RowCacheRunHash(open_run.node, open_run.list_begin, open_run.prefix_size, mask);
-      int32_t* first_run = row_cache_run_by_hash_.Find(hash);
-      const int32_t run = static_cast<int32_t>(row_cache_runs_.size());
-      row_cache_runs_.push_back(
+      int32_t* first_run = row_cache_.run_by_hash.Find(hash);
+      const int32_t run = static_cast<int32_t>(row_cache_.runs.size());
+      row_cache_.runs.push_back(
           {open_run.node,
            open_run.list_begin,
            open_run.prefix_size,
            mask,
            open_run.list_end,
-           static_cast<int32_t>(row_cache_run_accepted_.size()),
+           static_cast<int32_t>(row_cache_.run_accepted.size()),
            static_cast<int32_t>(tmp_row_cache_accepted_.size()) - open_run.accepted_begin,
            first_run == nullptr ? -1 : *first_run}
       );
-      row_cache_run_accepted_.insert(
-          row_cache_run_accepted_.end(),
+      row_cache_.run_accepted.insert(
+          row_cache_.run_accepted.end(),
           tmp_row_cache_accepted_.begin() + open_run.accepted_begin,
           tmp_row_cache_accepted_.end()
       );
       if (first_run == nullptr) {
-        row_cache_run_by_hash_.Insert(hash, run);
+        row_cache_.run_by_hash.Insert(hash, run);
       } else {
         *first_run = run;
       }
@@ -2265,40 +2147,40 @@ int32_t GrammarMatcher::Impl::InternLatestRowInRowCache() {
   }
   hash &= ~(static_cast<uint64_t>(1) << 63);  // never the reserved key
 
-  int32_t* first_node = row_cache_node_by_hash_.Find(hash);
+  int32_t* first_node = row_cache_.node_by_hash.Find(hash);
   int32_t node = first_node == nullptr ? -1 : *first_node;
-  for (; node != -1; node = row_cache_nodes_[node].next_with_same_hash) {
-    const auto& candidate = row_cache_nodes_[node];
+  for (; node != -1; node = row_cache_.nodes[node].next_with_same_hash) {
+    const auto& candidate = row_cache_.nodes[node];
     if (candidate.key_size == static_cast<int32_t>(key.size()) &&
         std::memcmp(
-            row_cache_keys_.data() + candidate.key_begin, key.data(), key.size() * sizeof(int32_t)
+            row_cache_.node_keys.data() + candidate.key_begin, key.data(), key.size() * sizeof(int32_t)
         ) == 0) {
       break;
     }
   }
   if (node == -1) {
-    node = static_cast<int32_t>(row_cache_nodes_.size());
-    row_cache_nodes_.push_back(
-        {static_cast<int32_t>(row_cache_keys_.size()),
+    node = static_cast<int32_t>(row_cache_.nodes.size());
+    row_cache_.nodes.push_back(
+        {static_cast<int32_t>(row_cache_.node_keys.size()),
          static_cast<int32_t>(key.size()),
          first_node == nullptr ? -1 : *first_node,
          -1,
          0}
     );
-    row_cache_keys_.insert(row_cache_keys_.end(), key.begin(), key.end());
+    row_cache_.node_keys.insert(row_cache_.node_keys.end(), key.begin(), key.end());
     if (first_node == nullptr) {
-      row_cache_node_by_hash_.Insert(hash, node);
+      row_cache_.node_by_hash.Insert(hash, node);
     } else {
       *first_node = node;
     }
   }
 
-  auto& found = row_cache_nodes_[node];
-  if (found.history_row_check_id == row_cache_check_id_) {
+  auto& found = row_cache_.nodes[node];
+  if (found.history_row_check_id == row_cache_.check_id) {
     PopLastStates(1);
   } else {
     found.history_row = row;
-    found.history_row_check_id = row_cache_check_id_;
+    found.history_row_check_id = row_cache_.check_id;
     row_cache_node_of_row_.resize(row - row_cache_base_row_ + 1);
     row_cache_node_of_row_[row - row_cache_base_row_] = node;
   }
@@ -2306,13 +2188,13 @@ int32_t GrammarMatcher::Impl::InternLatestRowInRowCache() {
 }
 
 int32_t GrammarMatcher::Impl::RowCacheHistoryRow(int32_t node) {
-  if (row_cache_nodes_[node].history_row_check_id == row_cache_check_id_) {
-    return row_cache_nodes_[node].history_row;
+  if (row_cache_.nodes[node].history_row_check_id == row_cache_.check_id) {
+    return row_cache_.nodes[node].history_row;
   }
   constexpr int32_t kStateInts = sizeof(ParserState) / sizeof(int32_t);
-  const int32_t key_begin = row_cache_nodes_[node].key_begin;
-  const int32_t key_size = row_cache_nodes_[node].key_size;
-  const int32_t num_states = row_cache_keys_[key_begin];
+  const int32_t key_begin = row_cache_.nodes[node].key_begin;
+  const int32_t key_size = row_cache_.nodes[node].key_size;
+  const int32_t num_states = row_cache_.node_keys[key_begin];
   const int32_t num_completable = (key_size - 2 - num_states * kStateInts) / (1 + kStateInts);
 
   // The rows this one refers to come first: they were created earlier, so this terminates.
@@ -2324,11 +2206,11 @@ int32_t GrammarMatcher::Impl::RowCacheHistoryRow(int32_t node) {
     }
   };
   for (int32_t i = 0; i < num_states; ++i) {
-    ensure_referenced_row(row_cache_keys_.data() + key_begin + 2 + i * kStateInts);
+    ensure_referenced_row(row_cache_.node_keys.data() + key_begin + 2 + i * kStateInts);
   }
   for (int32_t i = 0; i < num_completable; ++i) {
     ensure_referenced_row(
-        row_cache_keys_.data() + key_begin + 2 + num_states * kStateInts + i * (1 + kStateInts) + 1
+        row_cache_.node_keys.data() + key_begin + 2 + num_states * kStateInts + i * (1 + kStateInts) + 1
     );
   }
 
@@ -2340,13 +2222,13 @@ int32_t GrammarMatcher::Impl::RowCacheHistoryRow(int32_t node) {
       state.rule_start_pos = row;
     } else if (state.rule_start_pos <= kRowCacheFirstNodeRef) {
       state.rule_start_pos =
-          row_cache_nodes_[kRowCacheFirstNodeRef - state.rule_start_pos].history_row;
+          row_cache_.nodes[kRowCacheFirstNodeRef - state.rule_start_pos].history_row;
     } else if (state.rule_start_pos >= 0) {
       state.rule_start_pos = RowCacheContextHistoryRow(state.rule_start_pos);
     }
     return state;
   };
-  const int32_t* key = row_cache_keys_.data() + key_begin;
+  const int32_t* key = row_cache_.node_keys.data() + key_begin;
   tmp_row_cache_states_.clear();
   for (int32_t i = 0; i < num_states; ++i) {
     tmp_row_cache_states_.push_back(restore_state(key + 2 + i * kStateInts));
@@ -2363,8 +2245,8 @@ int32_t GrammarMatcher::Impl::RowCacheHistoryRow(int32_t node) {
   is_completed_.push_back(static_cast<uint8_t>(key[1]));
   scanable_state_history_.PushBack(tmp_row_cache_states_);
 
-  row_cache_nodes_[node].history_row = row;
-  row_cache_nodes_[node].history_row_check_id = row_cache_check_id_;
+  row_cache_.nodes[node].history_row = row;
+  row_cache_.nodes[node].history_row_check_id = row_cache_.check_id;
   row_cache_node_of_row_.resize(row - row_cache_base_row_ + 1);
   row_cache_node_of_row_[row - row_cache_base_row_] = node;
   return row;
@@ -2372,19 +2254,19 @@ int32_t GrammarMatcher::Impl::RowCacheHistoryRow(int32_t node) {
 
 int32_t GrammarMatcher::Impl::RowCacheTransition(int32_t node, uint8_t byte) {
   const uint64_t transition_key = (static_cast<uint64_t>(node) << 8) | byte;
-  if (const int32_t* next = row_cache_transitions_.Find(transition_key)) {
+  if (const int32_t* next = row_cache_.transitions.Find(transition_key)) {
     return *next;
   }
   const int32_t row = RowCacheHistoryRow(node);
   const int32_t next =
       AdvanceFromRow(row, byte) ? InternLatestRowInRowCache() : kRowCacheRejected;
-  row_cache_transitions_.Insert(transition_key, next);
+  row_cache_.transitions.Insert(transition_key, next);
   return next;
 }
 
 void GrammarMatcher::Impl::BeginRowCacheCheck() {
-  if (row_cache_nodes_.size() > kRowCacheMaxNodes || row_cache_runs_.size() > kRowCacheMaxRuns ||
-      row_cache_contexts_.size() > kRowCacheMaxNodes) {
+  if (row_cache_.nodes.size() > kRowCacheMaxNodes || row_cache_.runs.size() > kRowCacheMaxRuns ||
+      row_cache_.contexts.size() > kRowCacheMaxNodes) {
     ClearRowCache();
   }
   // Rows popped since the last check may have been replaced by other rows.
@@ -2392,7 +2274,7 @@ void GrammarMatcher::Impl::BeginRowCacheCheck() {
     row_cache_context_of_row_.resize(min_rows_after_pop_);
   }
   min_rows_after_pop_ = std::numeric_limits<int32_t>::max();
-  ++row_cache_check_id_;
+  ++row_cache_.check_id;
   row_cache_node_of_row_.clear();
   row_cache_base_row_ = scanable_state_history_.size();
   for (int32_t row = row_cache_context_of_row_.size(); row < row_cache_base_row_; ++row) {
@@ -2422,13 +2304,13 @@ int32_t GrammarMatcher::Impl::InternRowCacheContext(int32_t row) {
   }
   hash &= ~(static_cast<uint64_t>(1) << 63);
 
-  int32_t* first_context = row_cache_context_by_hash_.Find(hash);
+  int32_t* first_context = row_cache_.context_by_hash.Find(hash);
   int32_t context = first_context == nullptr ? -1 : *first_context;
-  for (; context != -1; context = row_cache_contexts_[context].next_with_same_hash) {
-    const auto& candidate = row_cache_contexts_[context];
+  for (; context != -1; context = row_cache_.contexts[context].next_with_same_hash) {
+    const auto& candidate = row_cache_.contexts[context];
     if (candidate.key_size == static_cast<int32_t>(key.size()) &&
         std::memcmp(
-            row_cache_context_keys_.data() + candidate.key_begin,
+            row_cache_.context_keys.data() + candidate.key_begin,
             key.data(),
             key.size() * sizeof(int32_t)
         ) == 0) {
@@ -2436,26 +2318,26 @@ int32_t GrammarMatcher::Impl::InternRowCacheContext(int32_t row) {
     }
   }
   if (context == -1) {
-    context = static_cast<int32_t>(row_cache_contexts_.size());
-    row_cache_contexts_.push_back(
-        {static_cast<int32_t>(row_cache_context_keys_.size()),
+    context = static_cast<int32_t>(row_cache_.contexts.size());
+    row_cache_.contexts.push_back(
+        {static_cast<int32_t>(row_cache_.context_keys.size()),
          static_cast<int32_t>(key.size()),
          first_context == nullptr ? -1 : *first_context,
          row}
     );
-    row_cache_context_keys_.insert(row_cache_context_keys_.end(), key.begin(), key.end());
+    row_cache_.context_keys.insert(row_cache_.context_keys.end(), key.begin(), key.end());
     if (first_context == nullptr) {
-      row_cache_context_by_hash_.Insert(hash, context);
+      row_cache_.context_by_hash.Insert(hash, context);
     } else {
       *first_context = context;
     }
   }
-  row_cache_contexts_[context].history_row = row;
+  row_cache_.contexts[context].history_row = row;
   return context;
 }
 
 int32_t GrammarMatcher::Impl::RowCacheContextHistoryRow(int32_t context) {
-  int32_t& row = row_cache_contexts_[context].history_row;
+  int32_t& row = row_cache_.contexts[context].history_row;
   const int32_t num_rows = static_cast<int32_t>(row_cache_context_of_row_.size());
   if (row >= num_rows || row_cache_context_of_row_[row] != context) {
     // The remembered row was popped. A node that refers to the context is reached only while a
@@ -2483,7 +2365,7 @@ void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
 
   BeginRowCacheCheck();
   // A node created by this check has no stored run yet.
-  const int32_t num_known_nodes = static_cast<int32_t>(row_cache_nodes_.size());
+  const int32_t num_known_nodes = static_cast<int32_t>(row_cache_.nodes.size());
   PushOneStateToCheck(state);
 
   // path[i] is the node after the first i bytes of the previous token.
@@ -2500,7 +2382,7 @@ void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
   open_runs.clear();
   run_accepted.clear();
   auto apply_run = [&](const RowCacheRun& run) {
-    const int32_t* accepted_ids = row_cache_run_accepted_.data() + run.accepted_begin;
+    const int32_t* accepted_ids = row_cache_.run_accepted.data() + run.accepted_begin;
     for (int32_t i = 0; i < run.accepted_size; ++i) {
       accepted_bitset->Set(accepted_ids[i], true);
     }

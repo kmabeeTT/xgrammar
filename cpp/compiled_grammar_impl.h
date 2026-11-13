@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "earley_parser.h"
+#include "row_cache.h"
 #include "support/dynamic_bitset.h"
 #include "support/reflection.h"
 #include "xgrammar/compiler.h"
@@ -156,6 +157,32 @@ class CompiledGrammar::Impl {
 
   /*! \brief Protects on-demand token mask cache insertion and cache serialization. */
   mutable std::mutex adaptive_token_mask_cache_mutex;
+
+  /*! \brief Row cache stores left by finished matchers of this grammar, for the next ones. */
+  std::vector<RowCacheStore> row_cache_pool;
+  std::mutex row_cache_pool_mutex;
+  static constexpr size_t kMaxPooledRowCaches = 16;
+
+  /*! \brief Take a filled row cache store from the pool, or an empty one. */
+  RowCacheStore TakeRowCache() {
+    std::lock_guard<std::mutex> lock(row_cache_pool_mutex);
+    if (row_cache_pool.empty()) {
+      return {};
+    }
+    RowCacheStore store = std::move(row_cache_pool.back());
+    row_cache_pool.pop_back();
+    return store;
+  }
+
+  void ReturnRowCache(RowCacheStore&& store) {
+    if (store.nodes.empty()) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(row_cache_pool_mutex);
+    if (row_cache_pool.size() < kMaxPooledRowCaches) {
+      row_cache_pool.push_back(std::move(store));
+    }
+  }
 
   /*! \brief Whether missing token mask cache entries should be generated on demand. */
   bool enable_dynamic_compilation{false};
