@@ -213,8 +213,18 @@ void EarleyParser::Complete(const ParserState& state, bool debug_print, bool mar
 
     // Check if the parent_state sits on a kRepeatRef edge
     bool handled_as_repeat = false;
-    const auto& parent_fsm = grammar_->per_rule_fsms[parent_state.rule_id].value();
-    for (const auto& edge : parent_fsm.GetFsm().GetFsm().GetEdges(parent_state.element_id)) {
+    const RuleFsmView& parent_view = GetRuleFsmView(parent_state.rule_id);
+    if (!(GetFsmStateFlags(parent_state.rule_id, parent_state.element_id) & kFsmStateHasRepeatRef
+        )) {
+      Enqueue(parent_state);
+      continue;
+    }
+    const FSMEdge* const edges_end =
+        parent_view.edges + parent_view.indptr[parent_state.element_id + 1];
+    for (const FSMEdge* edge_ptr = parent_view.edges + parent_view.indptr[parent_state.element_id];
+         edge_ptr != edges_end;
+         ++edge_ptr) {
+      const FSMEdge& edge = *edge_ptr;
       // Because of invariance, a state with a kRepeatRef edge has exactly one outgoing edge.
       if (!edge.IsRepeatRef()) continue;
       auto info = grammar_->complete_fsm.GetRepeatEdgeInfo(edge.GetAuxIndex());
@@ -403,7 +413,11 @@ bool EarleyParser::Advance(const uint8_t ch, bool debug_print) {
     if (skip_expired_states_ && IsExpiredState(state)) {
       continue;
     }
-    Scan(state, ch);
+    if (state.rule_id != -1) {
+      AdvanceFsm(state, ch);
+    } else {
+      Scan(state, ch);
+    }
   }
 
   // Check if the character is accepted.
@@ -415,12 +429,12 @@ bool EarleyParser::Advance(const uint8_t ch, bool debug_print) {
   }
 
   // execute Predict and Complete for all states in the queue until empty.
-  rule_id_to_completable_states_.PushBack(std::vector<std::pair<int32_t, ParserState>>());
+  rule_id_to_completable_states_.PushBackEmptyRow();
   if (capture_tracking_) {
     capture_event_history_.PushBack(std::vector<CaptureEvent>());
   }
   while (!tmp_process_state_queue_.empty()) {
-    const auto state = std::move(tmp_process_state_queue_.front());
+    const ParserState state = tmp_process_state_queue_.front();
     tmp_process_state_queue_.pop();
     auto [scanable, completable] = Predict(state, debug_print);
     if (completable) {
@@ -460,7 +474,7 @@ void EarleyParser::RemoveCommittedLazyStates() {
 
 EarleyParser::EarleyParser(const Grammar& grammar, std::optional<ParserState> initial_state)
     : grammar_(grammar),
-      fsm_state_flags_cache_(grammar->NumRules()),
+      rule_fsm_views_(grammar->NumRules()),
       rule_is_nullable_(grammar->NumRules(), 0) {
   if (!grammar->optimized) {
     XGRAMMAR_LOG(FATAL) << "The grammar is not optimized. Please optimize the grammar before using "
@@ -493,15 +507,27 @@ EarleyParser::EarleyParser(const Grammar& grammar, std::optional<ParserState> in
   PushStateAndExpand(initial_state.has_value() ? *initial_state : RootInitialState());
 }
 
+void EarleyParser::InitializeRuleFsmView(int32_t rule_id) {
+  XGRAMMAR_DCHECK(grammar_->per_rule_fsms[rule_id].has_value());
+  const auto& fsm = grammar_->per_rule_fsms[rule_id]->GetFsm();
+  RuleFsmView& view = rule_fsm_views_[rule_id];
+  view.flags.resize(fsm.NumStates());
+  view.start = fsm.GetStart();
+  view.indptr = fsm.GetFsm().GetEdges().indptr();
+  view.edges = fsm.GetFsm().GetEdges().data();
+  if (view.edges == nullptr) {
+    // An FSM without any edge: keep the view initialized with a valid, never-dereferenced pointer.
+    static const FSMEdge kNoEdge{};
+    view.edges = &kNoEdge;
+  }
+}
+
 uint8_t EarleyParser::InitializeFsmStateFlags(int32_t rule_id, int32_t state_id) {
   XGRAMMAR_DCHECK(grammar_->per_rule_fsms[rule_id].has_value());
   const auto& fsm = grammar_->per_rule_fsms[rule_id]->GetFsm();
-  auto& flags_cache = fsm_state_flags_cache_[rule_id];
-  if (flags_cache.empty()) {
-    flags_cache.resize(fsm.NumStates());
-  }
-  XGRAMMAR_DCHECK(state_id >= 0 && state_id < static_cast<int32_t>(flags_cache.size()));
-  uint8_t& flags = flags_cache[state_id];
+  RuleFsmView& view = GetRuleFsmView(rule_id);
+  XGRAMMAR_DCHECK(state_id >= 0 && state_id < static_cast<int32_t>(view.flags.size()));
+  uint8_t& flags = view.flags[state_id];
   if (flags & kFsmStateInitialized) {
     return flags;
   }
@@ -522,6 +548,9 @@ uint8_t EarleyParser::InitializeFsmStateFlags(int32_t rule_id, int32_t state_id)
       }
     } else if (edge.IsRuleRef() || edge.IsEpsilon() || edge.IsRepeatRef()) {
       flags |= kFsmStateNonTerminal;
+      if (edge.IsRepeatRef()) {
+        flags |= kFsmStateHasRepeatRef;
+      }
     }
   }
   return flags;
@@ -550,7 +579,7 @@ void EarleyParser::PushStateAndExpand(const ParserState& state) {
   tmp_states_to_be_added_.clear();
   tmp_completed_lazy_occurrences_.clear();
   Enqueue(state);
-  rule_id_to_completable_states_.PushBack(std::vector<std::pair<int32_t, ParserState>>());
+  rule_id_to_completable_states_.PushBackEmptyRow();
   if (capture_tracking_) {
     capture_event_history_.PushBack(std::vector<CaptureEvent>());
   }
@@ -694,10 +723,18 @@ void EarleyParser::ExpandNextRuleRefElement(
 
 void EarleyParser::ExpandNextRuleRefElementOnFSM(const ParserState& state, bool debug_print) {
   XGRAMMAR_DCHECK(state.rule_id != -1 && grammar_->per_rule_fsms[state.rule_id].has_value());
-  const auto& fsm = grammar_->per_rule_fsms[state.rule_id].value();
+  // The edges belong to the immutable grammar, so the pointers stay valid across the loop.
+  const FSMEdge* edge_ptr;
+  const FSMEdge* edges_end;
+  {
+    const RuleFsmView& view = GetRuleFsmView(state.rule_id);
+    edge_ptr = view.edges + view.indptr[state.element_id];
+    edges_end = view.edges + view.indptr[state.element_id + 1];
+  }
 
   // Add the rule reference pairs, and enqueue the epsilon edges.
-  for (const auto& edge : fsm.GetFsm().GetFsm().GetEdges(state.element_id)) {
+  for (; edge_ptr != edges_end; ++edge_ptr) {
+    const FSMEdge& edge = *edge_ptr;
     if (edge.IsEpsilon()) {
       Enqueue(ParserState{
           state.rule_id,
@@ -775,7 +812,8 @@ void EarleyParser::ExpandNextRuleRefElementOnFSM(const ParserState& state, bool 
                  ) != rule_id_to_completable_states_.Back().end();
         };
         const auto& parent_states_map = rule_id_to_completable_states_[state.rule_start_pos];
-        std::vector<std::pair<int32_t, ParserState>> to_added_states;
+        auto& to_added_states = tmp_right_recursion_parents_;
+        to_added_states.clear();
         for (const auto& parent_state_iter : parent_states_map) {
           if (parent_state_iter.first != state.rule_id) continue;
           const auto& parent_state = parent_state_iter.second;
@@ -849,11 +887,10 @@ void EarleyParser::ExpandNextRuleRefElementOnFSM(const ParserState& state, bool 
     const auto& ref_grammar_expr_id = ref_rule.body_expr_id;
 
     XGRAMMAR_DCHECK(grammar_->per_rule_fsms[ref_rule_id].has_value());
-    const auto& ref_fsm = grammar_->per_rule_fsms[ref_rule_id].value();
     Enqueue(ParserState{
         ref_rule_id,
         ref_grammar_expr_id,
-        ref_fsm.GetFsm().GetStart(),
+        GetRuleFsmView(ref_rule_id).start,
         right_recursion_to_root ? ParserState::kNoPrevInputPos
                                 : int32_t(rule_id_to_completable_states_.size() - 1),
         DeadlineForRule(ref_rule_id, state.budget_deadline),
@@ -1150,18 +1187,24 @@ void EarleyParser::AdvanceCharacterClassStar(
 
 void EarleyParser::AdvanceFsm(const ParserState& state, const uint8_t ch) {
   XGRAMMAR_DCHECK(state.rule_id != -1 && grammar_->per_rule_fsms[state.rule_id].has_value());
-  const auto& current_fsm = grammar_->per_rule_fsms[state.rule_id].value();
-  for (const auto& edge : current_fsm.GetFsm().GetFsm().GetEdges(state.element_id)) {
-    if ((!edge.IsCharRange()) || ch < edge.min || ch > edge.max) {
+  const FSMEdge* edge;
+  const FSMEdge* edges_end;
+  {
+    const RuleFsmView& view = GetRuleFsmView(state.rule_id);
+    edge = view.edges + view.indptr[state.element_id];
+    edges_end = view.edges + view.indptr[state.element_id + 1];
+  }
+  for (; edge != edges_end; ++edge) {
+    if ((!edge->IsCharRange()) || ch < edge->min || ch > edge->max) {
       continue;
     }
     auto new_state = state;
-    new_state.element_id = edge.target;
-    const uint8_t flags = GetFsmStateFlags(state.rule_id, edge.target);
+    new_state.element_id = edge->target;
+    const uint8_t flags = GetFsmStateFlags(state.rule_id, edge->target);
     if (!(flags & kFsmStateNonTerminal) && !(flags & kFsmStateEnd) && (flags & kFsmStateScanable)) {
-      EnqueueWithoutProcessing(std::move(new_state));
+      EnqueueWithoutProcessing(new_state);
     } else {
-      Enqueue(std::move(new_state));
+      Enqueue(new_state);
     }
   }
 }
@@ -1217,12 +1260,12 @@ bool EarleyParser::AdvanceAtomicToken(
     }
     return false;
   }
-  rule_id_to_completable_states_.PushBack(std::vector<std::pair<int32_t, ParserState>>());
+  rule_id_to_completable_states_.PushBackEmptyRow();
   if (capture_tracking_) {
     capture_event_history_.PushBack(std::vector<CaptureEvent>());
   }
   while (!tmp_process_state_queue_.empty()) {
-    const auto state = std::move(tmp_process_state_queue_.front());
+    const auto state = tmp_process_state_queue_.front();
     tmp_process_state_queue_.pop();
     auto [scanable, completable] = Predict(state, debug_print);
     if (completable) {
@@ -1269,37 +1312,14 @@ int32_t EarleyParser::FindMidTokenExcludeEdgeRow(int32_t num_rows, int32_t token
   return 0;
 }
 
-bool RepeatDetector::IsVisited(const ParserState& state) const {
-  // If the size is larger than the threshold, then we use the set to check.
-  if (size_ > transition_threshold_) {
-    return visited_set_.find(state) != visited_set_.end();
-  }
-  return std::find_if(
-             visited_vector_.begin(),
-             visited_vector_.begin() + size_,
-             [&state](const ParserState& s) { return StateEqualForParsing()(state, s); }
-         ) != visited_vector_.begin() + size_;
-}
-
-void RepeatDetector::Insert(const ParserState& state) {
+void RepeatDetector::InsertSlow(const ParserState& state) {
   if (size_ == transition_threshold_) {
     for (const auto& s : visited_vector_) {
       visited_set_.insert(s);
     }
   }
   size_++;
-  if (size_ > transition_threshold_) {
-    visited_set_.insert(state);
-  } else {
-    visited_vector_[size_ - 1] = state;
-  }
-}
-
-void RepeatDetector::Clear() {
-  if (size_ > transition_threshold_) {
-    visited_set_.clear();
-  }
-  size_ = 0;
+  visited_set_.insert(state);
 }
 
 }  // namespace xgrammar

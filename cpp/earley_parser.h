@@ -8,6 +8,7 @@
 #define XGRAMMAR_EARLEY_PARSER_H_
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <ostream>
@@ -16,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "fsm.h"
 #include "grammar_impl.h"
 #include "support/compact_2d_array.h"
 #include "support/utils.h"
@@ -249,6 +251,12 @@ class RepeatDetector {
 
   int size_ = 0;
 
+  // ParserState is ten int32_t fields without padding, so equality of all fields is byte equality.
+  static_assert(sizeof(ParserState) == 10 * sizeof(int32_t));
+  static bool Equal(const ParserState& lhs, const ParserState& rhs) {
+    return std::memcmp(&lhs, &rhs, sizeof(ParserState)) == 0;
+  }
+
  public:
   RepeatDetector(const int transition_threshold = 50)
       : transition_threshold_(transition_threshold), size_(0) {
@@ -259,16 +267,68 @@ class RepeatDetector {
    * \brief Check if the element is visited.
    * \return True if visited, false otherwise.
    */
-  bool IsVisited(const ParserState& state) const;
+  bool IsVisited(const ParserState& state) const {
+    if (size_ > transition_threshold_) {
+      return visited_set_.find(state) != visited_set_.end();
+    }
+    const ParserState* visited = visited_vector_.data();
+    for (int i = 0; i < size_; ++i) {
+      if (Equal(visited[i], state)) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   /*!
    * \brief Add the state into the visited states.
    * \param state The state to be added.
    */
-  void Insert(const ParserState& state);
+  void Insert(const ParserState& state) {
+    if (size_ < transition_threshold_) {
+      visited_vector_[size_++] = state;
+      return;
+    }
+    InsertSlow(state);
+  }
+
+  /*! \brief Add the state unless it is already visited. \return True if it was added. */
+  bool InsertIfNotVisited(const ParserState& state) {
+    if (IsVisited(state)) {
+      return false;
+    }
+    Insert(state);
+    return true;
+  }
 
   /*! \brief Reset the detector. */
-  void Clear();
+  void Clear() {
+    if (size_ > transition_threshold_) {
+      visited_set_.clear();
+    }
+    size_ = 0;
+  }
+
+ private:
+  void InsertSlow(const ParserState& state);
+};
+
+/*! \brief FIFO of the states waiting for prediction and completion; storage is reused. */
+class ParserStateQueue {
+ public:
+  bool empty() const { return head_ == states_.size(); }
+  const ParserState& front() const { return states_[head_]; }
+  void push(const ParserState& state) { states_.push_back(state); }
+  void pop() {
+    if (++head_ == states_.size()) {
+      states_.clear();
+      head_ = 0;
+    }
+  }
+
+ private:
+  std::vector<ParserState> states_;
+  size_t head_ = 0;
 };
 
 /*! \brief A concrete occurrence of a captured rule in an Earley parent chain. */
@@ -334,7 +394,7 @@ class EarleyParser {
   bool lookahead_reached_exclude_token_ = false;
 
   /*! \brief store when accepting i characters, if the stop token can be accepted. */
-  std::vector<bool> is_completed_;
+  std::vector<uint8_t> is_completed_;
 
   /*!
    * \brief rule_id_to_completable_states[i][j] is the i pos j rule_id states. Earley
@@ -355,7 +415,7 @@ class EarleyParser {
   std::vector<ParserState> tmp_states_to_be_added_;
 
   /*! \brief It's the processing queue of the earley parser. */
-  std::queue<ParserState> tmp_process_state_queue_;
+  ParserStateQueue tmp_process_state_queue_;
 
   /*! \brief The class is used to check if a state has been added into the queue. */
   RepeatDetector tmp_states_visited_in_queue_;
@@ -370,28 +430,45 @@ class EarleyParser {
     kFsmStateEnd = 1 << 3,
     kFsmStateHasEdges = 1 << 4,
     kFsmStateHasExcludeToken = 1 << 5,
+    kFsmStateHasRepeatRef = 1 << 6,
   };
 
-  /*! \brief Lazily-computed FSM state properties, indexed by rule id and state id. */
-  std::vector<std::vector<uint8_t>> fsm_state_flags_cache_;
+  /*! \brief Direct access to a rule's FSM and its lazily-computed state properties. */
+  struct RuleFsmView {
+    /*! \brief The edges of all states and the offsets of each state's edges; null until used. */
+    const FSMEdge* edges = nullptr;
+    const int32_t* indptr = nullptr;
+    /*! \brief FsmStateFlag bits per state id; 0 means not computed yet. */
+    std::vector<uint8_t> flags;
+    int32_t start = 0;
+  };
+
+  /*! \brief Indexed by rule id. */
+  std::vector<RuleFsmView> rule_fsm_views_;
 
   /*! \brief Whether each rule can match the empty string. */
   std::vector<uint8_t> rule_is_nullable_;
+
+  void InitializeRuleFsmView(int32_t rule_id);
+
+  RuleFsmView& GetRuleFsmView(int32_t rule_id) {
+    XGRAMMAR_DCHECK(rule_id >= 0 && rule_id < static_cast<int32_t>(rule_fsm_views_.size()));
+    RuleFsmView& view = rule_fsm_views_[rule_id];
+    if (view.edges == nullptr) {
+      InitializeRuleFsmView(rule_id);
+    }
+    return view;
+  }
 
   /*! \brief Compute and cache properties for a state in a per-rule FSM. */
   uint8_t InitializeFsmStateFlags(int32_t rule_id, int32_t state_id);
 
   /*! \brief Return cached properties for a state in a per-rule FSM. */
   uint8_t GetFsmStateFlags(int32_t rule_id, int32_t state_id) {
-    XGRAMMAR_DCHECK(rule_id >= 0 && rule_id < static_cast<int32_t>(fsm_state_flags_cache_.size()));
-    auto& flags_cache = fsm_state_flags_cache_[rule_id];
-    if (!flags_cache.empty()) {
-      XGRAMMAR_DCHECK(state_id >= 0 && state_id < static_cast<int32_t>(flags_cache.size()));
-      if (flags_cache[state_id] != 0) {
-        return flags_cache[state_id];
-      }
-    }
-    return InitializeFsmStateFlags(rule_id, state_id);
+    const RuleFsmView& view = GetRuleFsmView(rule_id);
+    XGRAMMAR_DCHECK(state_id >= 0 && state_id < static_cast<int32_t>(view.flags.size()));
+    const uint8_t flags = view.flags[state_id];
+    return flags != 0 ? flags : InitializeFsmStateFlags(rule_id, state_id);
   }
 
   bool IsRuleNullable(int32_t rule_id) const { return rule_is_nullable_[rule_id] != 0; }
@@ -521,6 +598,9 @@ class EarleyParser {
    * finalized, so the occurrence cannot be extended further.
    */
   std::vector<std::pair<int32_t, int32_t>> tmp_completed_lazy_occurrences_;
+
+  /*! \brief Scratch storage of ExpandNextRuleRefElementOnFSM. */
+  std::vector<std::pair<int32_t, ParserState>> tmp_right_recursion_parents_;
 
   /*! \brief Remove the states of the lazy occurrences completed in the current row. */
   void RemoveCommittedLazyStates();
@@ -661,9 +741,8 @@ class EarleyParser {
    * \details The state is enqueued if it is not visited in the queue.
    */
   void Enqueue(const ParserState& state) {
-    if (!IsStateVisitedInQueue(state)) {
+    if (tmp_states_visited_in_queue_.InsertIfNotVisited(state)) {
       tmp_process_state_queue_.push(state);
-      tmp_states_visited_in_queue_.Insert(state);
     }
   }
 
@@ -672,8 +751,7 @@ class EarleyParser {
    * \param state The state to be enqueued.
    */
   void EnqueueWithoutProcessing(const ParserState& state) {
-    if (!IsStateVisitedInQueue(state)) {
-      tmp_states_visited_in_queue_.Insert(state);
+    if (tmp_states_visited_in_queue_.InsertIfNotVisited(state)) {
       tmp_states_to_be_added_.push_back(state);
     }
   }
@@ -742,12 +820,22 @@ class EarleyParser {
    * \param state The state to be pushed.
    */
   void PushOneStateToCheck(const ParserState& state) {
-    PushStatesToCheck(std::vector<ParserState>{state}, is_completed_.back());
+    const bool completed = is_completed_.back();
+    rule_id_to_completable_states_.PushBackEmptyRow();
+    is_completed_.push_back(completed);
+    scanable_state_history_.PushBack(&state, 1);
+    if (capture_tracking_) {
+      capture_event_history_.PushBack(std::vector<CaptureEvent>());
+    }
+    if (has_char_budget_rules_) {
+      char_count_history_.push_back(GetCurrentCharIndex());
+      char_budget_entry_history_.push_back(char_budget_entry_history_.back());
+    }
   }
 
   /*! \brief Push a temporary parser row for token-mask checking. */
   void PushStatesToCheck(const std::vector<ParserState>& states, bool completed) {
-    rule_id_to_completable_states_.PushBack(std::vector<std::pair<int32_t, ParserState>>());
+    rule_id_to_completable_states_.PushBackEmptyRow();
     is_completed_.push_back(completed);
     scanable_state_history_.PushBack(states);
     if (capture_tracking_) {
