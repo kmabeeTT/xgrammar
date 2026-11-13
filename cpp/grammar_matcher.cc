@@ -837,11 +837,13 @@ class GrammarMatcher::Impl : public EarleyParser {
   /*!
    * \brief Cache of the parser rows reached while checking uncertain tokens, kept across masks.
    *
-   * A row is stored in a position-independent form: a rule start position inside the committed
-   * history stays as it is, the row's own position becomes kRowCacheSelf, and the position of
-   * another temporary row becomes a reference to that row's cache node. Rows with equal stored
-   * forms accept the same byte strings, so the byte transitions between nodes are computed once.
-   * Committed rows never change without a pop below them, which drops the whole cache.
+   * A row is stored in a position-independent form. A rule start position matters to the parser
+   * only through the rule_id_to_completable_states_ row it names, so a position inside the
+   * committed history becomes the id of that row's content (a context), the row's own position
+   * becomes kRowCacheSelf, and the position of another temporary row becomes a reference to that
+   * row's cache node. Rows with equal stored forms accept the same byte strings, so the byte
+   * transitions between nodes are computed once, also when the same structure is entered again
+   * at another place of the input.
    */
   struct RowCacheNode {
     /*! \brief The stored form: a span of row_cache_keys_. */
@@ -865,8 +867,26 @@ class GrammarMatcher::Impl : public EarleyParser {
   FlatUInt64Map row_cache_node_by_hash_;
   /*! \brief (node << 8 | byte) -> the node after the byte, or kRowCacheRejected. */
   FlatUInt64Map row_cache_transitions_;
-  /*! \brief The cached rows refer to history rows below this one. */
-  int32_t row_cache_valid_rows_ = 0;
+  /*! \brief The content of a committed rule_id_to_completable_states_ row, positions replaced
+   * as in a node. */
+  struct RowCacheContext {
+    int32_t key_begin;
+    int32_t key_size;
+    int32_t next_with_same_hash;
+    /*! \brief A committed row that had this content when it was last seen. */
+    int32_t history_row;
+  };
+  std::vector<RowCacheContext> row_cache_contexts_;
+  std::vector<int32_t> row_cache_context_keys_;
+  FlatUInt64Map row_cache_context_by_hash_;
+  /*! \brief The context of each committed history row the cache has seen. */
+  std::vector<int32_t> row_cache_context_of_row_;
+
+  /*! \brief Find or create the context of committed row `row`; the rows below it have theirs. */
+  int32_t InternRowCacheContext(int32_t row);
+
+  /*! \brief A committed row whose content is the context. */
+  int32_t RowCacheContextHistoryRow(int32_t context);
   /*! \brief The first temporary history row of the running check. */
   int32_t row_cache_base_row_ = 0;
   uint32_t row_cache_check_id_ = 0;
@@ -954,8 +974,11 @@ class GrammarMatcher::Impl : public EarleyParser {
   void ClearRowCache();
 
   int32_t RowCachePosition(int32_t position, int32_t own_row) const {
-    if (position < row_cache_base_row_) {
+    if (position < 0) {
       return position;
+    }
+    if (position < row_cache_base_row_) {
+      return row_cache_context_of_row_[position];
     }
     if (position == own_row) {
       return kRowCacheSelf;
@@ -2176,6 +2199,10 @@ void GrammarMatcher::Impl::ClearRowCache() {
   row_cache_runs_.clear();
   row_cache_run_accepted_.clear();
   row_cache_run_by_hash_.Clear();
+  row_cache_contexts_.clear();
+  row_cache_context_keys_.clear();
+  row_cache_context_by_hash_.Clear();
+  row_cache_context_of_row_.clear();
 }
 
 void GrammarMatcher::Impl::CloseRowCacheRuns(int32_t pos, const AdaptiveTokenMask* mask) {
@@ -2321,6 +2348,8 @@ int32_t GrammarMatcher::Impl::RowCacheHistoryRow(int32_t node) {
     } else if (state.rule_start_pos <= kRowCacheFirstNodeRef) {
       state.rule_start_pos =
           row_cache_nodes_[kRowCacheFirstNodeRef - state.rule_start_pos].history_row;
+    } else if (state.rule_start_pos >= 0) {
+      state.rule_start_pos = RowCacheContextHistoryRow(state.rule_start_pos);
     }
     return state;
   };
@@ -2361,15 +2390,90 @@ int32_t GrammarMatcher::Impl::RowCacheTransition(int32_t node, uint8_t byte) {
 }
 
 void GrammarMatcher::Impl::BeginRowCacheCheck() {
-  if (min_rows_after_pop_ < row_cache_valid_rows_ ||
-      row_cache_nodes_.size() > kRowCacheMaxNodes || row_cache_runs_.size() > kRowCacheMaxRuns) {
+  if (row_cache_nodes_.size() > kRowCacheMaxNodes || row_cache_runs_.size() > kRowCacheMaxRuns ||
+      row_cache_contexts_.size() > kRowCacheMaxNodes) {
     ClearRowCache();
+  }
+  // Rows popped since the last check may have been replaced by other rows.
+  if (min_rows_after_pop_ < static_cast<int32_t>(row_cache_context_of_row_.size())) {
+    row_cache_context_of_row_.resize(min_rows_after_pop_);
   }
   min_rows_after_pop_ = std::numeric_limits<int32_t>::max();
   ++row_cache_check_id_;
   row_cache_node_of_row_.clear();
   row_cache_base_row_ = scanable_state_history_.size();
-  row_cache_valid_rows_ = row_cache_base_row_;
+  for (int32_t row = row_cache_context_of_row_.size(); row < row_cache_base_row_; ++row) {
+    row_cache_context_of_row_.push_back(InternRowCacheContext(row));
+  }
+}
+
+int32_t GrammarMatcher::Impl::InternRowCacheContext(int32_t row) {
+  const auto completable = rule_id_to_completable_states_[row];
+  constexpr int32_t kStateInts = sizeof(ParserState) / sizeof(int32_t);
+  auto& key = tmp_row_cache_key_;
+  key.resize(completable.size() * (1 + kStateInts));
+  int32_t* out = key.data();
+  for (const auto& [ref_rule_id, parent_state] : completable) {
+    *out++ = ref_rule_id;
+    std::memcpy(out, &parent_state, sizeof(ParserState));
+    const int32_t position = parent_state.rule_start_pos;
+    reinterpret_cast<ParserState*>(out)->rule_start_pos =
+        position < 0 ? position
+                     : position == row ? kRowCacheSelf : row_cache_context_of_row_[position];
+    out += kStateInts;
+  }
+  uint64_t hash = 0x2545F4914F6CDD1Dull;
+  for (int32_t value : key) {
+    hash = (hash ^ static_cast<uint32_t>(value)) * 0xFF51AFD7ED558CCDull;
+    hash ^= hash >> 32;
+  }
+  hash &= ~(static_cast<uint64_t>(1) << 63);
+
+  int32_t* first_context = row_cache_context_by_hash_.Find(hash);
+  int32_t context = first_context == nullptr ? -1 : *first_context;
+  for (; context != -1; context = row_cache_contexts_[context].next_with_same_hash) {
+    const auto& candidate = row_cache_contexts_[context];
+    if (candidate.key_size == static_cast<int32_t>(key.size()) &&
+        std::memcmp(
+            row_cache_context_keys_.data() + candidate.key_begin,
+            key.data(),
+            key.size() * sizeof(int32_t)
+        ) == 0) {
+      break;
+    }
+  }
+  if (context == -1) {
+    context = static_cast<int32_t>(row_cache_contexts_.size());
+    row_cache_contexts_.push_back(
+        {static_cast<int32_t>(row_cache_context_keys_.size()),
+         static_cast<int32_t>(key.size()),
+         first_context == nullptr ? -1 : *first_context,
+         row}
+    );
+    row_cache_context_keys_.insert(row_cache_context_keys_.end(), key.begin(), key.end());
+    if (first_context == nullptr) {
+      row_cache_context_by_hash_.Insert(hash, context);
+    } else {
+      *first_context = context;
+    }
+  }
+  row_cache_contexts_[context].history_row = row;
+  return context;
+}
+
+int32_t GrammarMatcher::Impl::RowCacheContextHistoryRow(int32_t context) {
+  int32_t& row = row_cache_contexts_[context].history_row;
+  const int32_t num_rows = static_cast<int32_t>(row_cache_context_of_row_.size());
+  if (row >= num_rows || row_cache_context_of_row_[row] != context) {
+    // The remembered row was popped. A node that refers to the context is reached only while a
+    // committed row still has that content.
+    row = num_rows - 1;
+    while (row >= 0 && row_cache_context_of_row_[row] != context) {
+      --row;
+    }
+    XGRAMMAR_CHECK(row >= 0) << "No committed row holds the row cache context " << context;
+  }
+  return row;
 }
 
 bool GrammarMatcher::Impl::RowCacheCompletesWith(const std::string& token) {
