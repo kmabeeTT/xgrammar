@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -85,6 +86,23 @@ class FlatUInt64Map {
   size_t size_ = 0;
   size_t mask_ = 0;
 };
+
+/*! \brief Hash of a stored form; never the reserved key of FlatUInt64Map. */
+inline uint64_t RowCacheHash(const int32_t* data, size_t size) {
+  uint64_t hash = 0x9E3779B97F4A7C15ull;
+  size_t i = 0;
+  for (; i + 2 <= size; i += 2) {
+    uint64_t two_values;
+    std::memcpy(&two_values, data + i, sizeof(two_values));
+    hash = (hash ^ two_values) * 0xFF51AFD7ED558CCDull;
+    hash ^= hash >> 32;
+  }
+  if (i < size) {
+    hash = (hash ^ static_cast<uint32_t>(data[i])) * 0xFF51AFD7ED558CCDull;
+    hash ^= hash >> 32;
+  }
+  return hash & ~(static_cast<uint64_t>(1) << 63);
+}
 
 /*! \brief A parser row in position-independent form. */
 struct RowCacheNode {

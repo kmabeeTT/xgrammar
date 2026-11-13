@@ -770,6 +770,8 @@ class GrammarMatcher::Impl : public EarleyParser {
   DynamicBitset tmp_accepted_bitset_;
   std::vector<int32_t> tmp_rejected_indices_;
   std::vector<const AdaptiveTokenMask*> tmp_state_masks_;
+  std::vector<ParserState> tmp_latest_states_;
+  std::vector<std::pair<ParserState, const AdaptiveTokenMask*>> tmp_latest_states_with_masks_;
   std::vector<int32_t> tmp_rejected_indices_delta_;
 
   /*!
@@ -2155,12 +2157,7 @@ int32_t GrammarMatcher::Impl::InternLatestRowInRowCache() {
     out += kStateInts;
   }
 
-  uint64_t hash = 0x9E3779B97F4A7C15ull;
-  for (int32_t value : key) {
-    hash = (hash ^ static_cast<uint32_t>(value)) * 0xFF51AFD7ED558CCDull;
-    hash ^= hash >> 32;
-  }
-  hash &= ~(static_cast<uint64_t>(1) << 63);  // never the reserved key
+  const uint64_t hash = RowCacheHash(key.data(), key.size());
 
   int32_t* first_node = row_cache_.node_by_hash.Find(hash);
   int32_t node = first_node == nullptr ? -1 : *first_node;
@@ -2312,12 +2309,7 @@ int32_t GrammarMatcher::Impl::InternRowCacheContext(int32_t row) {
                      : position == row ? kRowCacheSelf : row_cache_context_of_row_[position];
     out += kStateInts;
   }
-  uint64_t hash = 0x2545F4914F6CDD1Dull;
-  for (int32_t value : key) {
-    hash = (hash ^ static_cast<uint32_t>(value)) * 0xFF51AFD7ED558CCDull;
-    hash ^= hash >> 32;
-  }
-  hash &= ~(static_cast<uint64_t>(1) << 63);
+  const uint64_t hash = RowCacheHash(key.data(), key.size());
 
   int32_t* first_context = row_cache_.context_by_hash.Find(hash);
   int32_t context = first_context == nullptr ? -1 : *first_context;
@@ -2566,7 +2558,8 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
   const auto& subtree_range = tokenizer_info_.GetTrieSubtreeNodesRange();
   // We need to have a copy, because scanable_state_history_ will be modified during the
   // FillNextTokenBitmask process, which can lead to undefined behavior.
-  std::vector<ParserState> latest_states;
+  auto& latest_states = tmp_latest_states_;
+  latest_states.clear();
   for (const auto& state : scanable_state_history_[scanable_state_history_.size() - 1]) {
     if (skip_expired && IsExpiredState(state)) {
       continue;
@@ -2606,7 +2599,8 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
                        << ", num of states=" << latest_states.size();
   }
 
-  std::vector<std::pair<ParserState, const AdaptiveTokenMask*>> latest_states_with_masks;
+  auto& latest_states_with_masks = tmp_latest_states_with_masks_;
+  latest_states_with_masks.clear();
 
   for (size_t state_index = 0; state_index < latest_states.size(); ++state_index) {
     const auto& state = latest_states[state_index];
