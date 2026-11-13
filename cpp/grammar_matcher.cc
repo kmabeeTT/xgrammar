@@ -26,6 +26,7 @@
 #include "compiled_grammar_impl.h"
 #include "earley_parser.h"
 #include "grammar_impl.h"
+#include "row_cache.h"
 #include "support/dynamic_bitset.h"
 #include "support/encoding.h"
 #include "support/int_set.h"
@@ -540,6 +541,7 @@ class GrammarMatcher::Impl : public EarleyParser {
     temporary_input_bytes_.clear();
     accepted_bytes_.clear();
     row_byte_end_.assign(1, 0);
+    row_cache_.context_of_row.clear();
     EarleyParser::Reset();
   }
 
@@ -761,6 +763,64 @@ class GrammarMatcher::Impl : public EarleyParser {
   DynamicBitset tmp_accepted_bitset_;
   std::vector<int32_t> tmp_rejected_indices_;
   std::vector<int32_t> tmp_rejected_indices_delta_;
+
+  /*!
+   * \brief The rows reached by the uncertain-token checks so far (see RowCache), with the
+   * matcher's view of its own history. A copy of the matcher starts with an empty cache.
+   */
+  struct MatcherRowCache : RowCache {
+    /*! \brief The context of each committed history row the cache has seen. */
+    std::vector<int32_t> context_of_row;
+
+    MatcherRowCache() = default;
+    MatcherRowCache(const MatcherRowCache&) : RowCache() {}
+    MatcherRowCache& operator=(const MatcherRowCache&) = delete;
+  } row_cache_;
+  /*! \brief The first temporary history row of the running check. */
+  int32_t row_cache_base_row_ = 0;
+  /*! \brief The cached row held by each temporary history row of the running check. */
+  std::vector<int32_t> row_cache_id_of_row_;
+  /*! \brief row_cache_path_[i] is the cached row after the first i bytes of the token being
+   * checked. */
+  std::vector<int32_t> row_cache_path_;
+  std::vector<int32_t> tmp_row_cache_key_;
+
+  /*! \brief Whether a row of this grammar is determined by its states and the rows they start
+   * in. Budgets, captures and token edges read other state or rewrite committed rows. */
+  bool CanUseRowCache() const {
+    return !has_budget_rules_ && !has_char_budget_rules_ && !capture_tracking_ &&
+           !has_lazy_rules_ && !grammar_->has_token_edges;
+  }
+
+  /*! \brief Start a check: find the contexts of the history rows committed since the last one.
+   * The rows pushed from now on are the temporary rows of the check. A cache that has reached
+   * its size limit is emptied first. */
+  void BeginRowCacheCheck();
+
+  /*! \brief Pop the temporary rows of the check. */
+  void EndRowCacheCheck() { PopLastStates(scanable_state_history_.size() - row_cache_base_row_); }
+
+  /*! \brief Pop the temporary rows above those of the first `size` + 1 rows of the path, if
+   * the temporary rows hold more than RowCache::kMaxTemporaryStates states. */
+  void PopRowCacheRowsAfterPath(int size);
+
+  /*! \brief Append the stored form of a state of history row `row` to tmp_row_cache_key_. */
+  void AppendStateToRowCacheKey(const ParserState& state, int32_t row);
+
+  /*! \brief Append the stored form of the rule_id_to_completable_states_ entries of `row`. */
+  void AppendCompletableToRowCacheKey(int32_t row);
+
+  /*! \brief Return the cached row of the latest history row, which is a temporary row. The
+   * history row is popped again if another history row already holds that cached row. */
+  int32_t CacheLatestRow();
+
+  /*! \brief Return a history row holding the cached row after the first `size` bytes of the
+   * token. If there is none yet, the row is computed again from the row before it. */
+  int32_t HistoryRowOfRowCachePath(const std::string& token, int size);
+
+  /*! \brief Find the cached row after the first `size` + 1 bytes of the token from the one
+   * after `size` bytes. \return False if the byte is rejected. */
+  bool AdvanceRowCachePath(const std::string& token, int size);
 };
 
 class BatchGrammarMatcher::Impl {
@@ -1938,6 +1998,169 @@ static std::optional<RepeatEdgeRef> GetRepeatEdgeInfo(
   return std::nullopt;
 }
 
+void GrammarMatcher::Impl::AppendStateToRowCacheKey(const ParserState& state, int32_t row) {
+  int32_t start = state.rule_start_pos;
+  if (start == row) {
+    start = RowCache::kSelf;
+  } else if (start >= row_cache_base_row_) {
+    start = RowCache::kFirstRowRef - row_cache_id_of_row_[start - row_cache_base_row_];
+  } else if (start >= 0) {
+    start = row_cache_.context_of_row[start];
+  }
+  tmp_row_cache_key_.insert(
+      tmp_row_cache_key_.end(),
+      {state.rule_id,
+       state.sequence_id,
+       state.element_id,
+       start,
+       state.budget_deadline,
+       state.sub_element_id,
+       state.repeat_count,
+       state.partial_codepoint,
+       state.active_temperature_rule_id,
+       state.char_budget_deadline}
+  );
+}
+
+void GrammarMatcher::Impl::AppendCompletableToRowCacheKey(int32_t row) {
+  for (const auto& [ref_rule_id, parent_state] : rule_id_to_completable_states_[row]) {
+    tmp_row_cache_key_.push_back(ref_rule_id);
+    AppendStateToRowCacheKey(parent_state, row);
+  }
+}
+
+void GrammarMatcher::Impl::BeginRowCacheCheck() {
+  if (row_cache_.num_bytes >= RowCache::kMaxBytes) {
+    static_cast<RowCache&>(row_cache_) = RowCache();
+    row_cache_.context_of_row.clear();
+  }
+  ++row_cache_.num_checks;
+  row_cache_id_of_row_.clear();
+  row_cache_base_row_ = scanable_state_history_.size();
+  auto& context_of_row = row_cache_.context_of_row;
+  XGRAMMAR_DCHECK(static_cast<int32_t>(context_of_row.size()) <= row_cache_base_row_);
+  for (int32_t row = context_of_row.size(); row < row_cache_base_row_; ++row) {
+    int32_t context;
+    if (rule_id_to_completable_states_[row].size() > RowCache::kMaxKeyStates) {
+      context = row_cache_.num_contexts++;
+    } else {
+      tmp_row_cache_key_.clear();
+      AppendCompletableToRowCacheKey(row);
+      const auto [it, inserted] =
+          row_cache_.context_ids.try_emplace(tmp_row_cache_key_, row_cache_.num_contexts);
+      if (inserted) {
+        ++row_cache_.num_contexts;
+        row_cache_.num_bytes += RowCache::KeyBytes(tmp_row_cache_key_.size());
+      }
+      context = it->second;
+    }
+    context_of_row.push_back(context);
+  }
+}
+
+int32_t GrammarMatcher::Impl::CacheLatestRow() {
+  const int32_t row = scanable_state_history_.size() - 1;
+  const auto states = scanable_state_history_[row];
+  // A very large row gets an id of its own without being stored, so it is never found again.
+  const bool store_key =
+      states.size() + rule_id_to_completable_states_[row].size() <= RowCache::kMaxKeyStates;
+  auto it = row_cache_.row_ids.end();
+  if (store_key) {
+    tmp_row_cache_key_.assign({static_cast<int32_t>(is_completed_.back()), states.size()});
+    for (const auto& state : states) {
+      AppendStateToRowCacheKey(state, row);
+    }
+    AppendCompletableToRowCacheKey(row);
+    it = row_cache_.row_ids.find(tmp_row_cache_key_);
+  }
+  int32_t cached_row = it != row_cache_.row_ids.end() ? it->second : -1;
+  if (cached_row == -1) {
+    cached_row = row_cache_.row_infos.size();
+    row_cache_.row_infos.emplace_back();
+    row_cache_.num_bytes += sizeof(RowCache::RowInfo);
+    if (store_key) {
+      row_cache_.row_ids.emplace(tmp_row_cache_key_, cached_row);
+      row_cache_.num_bytes += RowCache::KeyBytes(tmp_row_cache_key_.size());
+    }
+  }
+
+  auto& info = row_cache_.row_infos[cached_row];
+  if (info.check == row_cache_.num_checks) {
+    PopLastStates(1);
+  } else {
+    info.history_row = row;
+    info.check = row_cache_.num_checks;
+    row_cache_id_of_row_.resize(row - row_cache_base_row_ + 1);
+    row_cache_id_of_row_.back() = cached_row;
+  }
+  return cached_row;
+}
+
+void GrammarMatcher::Impl::PopRowCacheRowsAfterPath(int size) {
+  const int32_t* row_offsets = scanable_state_history_.indptr();
+  if (row_offsets[scanable_state_history_.size()] - row_offsets[row_cache_base_row_] <=
+      RowCache::kMaxTemporaryStates) {
+    return;
+  }
+  int32_t last_kept_row = row_cache_base_row_;
+  for (int i = 0; i <= size; ++i) {
+    const auto& info = row_cache_.row_infos[row_cache_path_[i]];
+    if (info.check == row_cache_.num_checks) {
+      last_kept_row = std::max(last_kept_row, info.history_row);
+    }
+  }
+  const int32_t num_kept = last_kept_row - row_cache_base_row_ + 1;
+  for (size_t i = num_kept; i < row_cache_id_of_row_.size(); ++i) {
+    // The cached row has no history row any more.
+    row_cache_.row_infos[row_cache_id_of_row_[i]].check = 0;
+  }
+  row_cache_id_of_row_.resize(num_kept);
+  PopLastStates(scanable_state_history_.size() - last_kept_row - 1);
+}
+
+int32_t GrammarMatcher::Impl::HistoryRowOfRowCachePath(const std::string& token, int size) {
+  const auto& info = row_cache_.row_infos[row_cache_path_[size]];
+  if (info.check == row_cache_.num_checks) {
+    return info.history_row;
+  }
+  // The row was reached through cached transitions only. The first row of a path always has a
+  // history row, and the byte was accepted before.
+  bool accepted = AdvanceFromRow(
+      HistoryRowOfRowCachePath(token, size - 1), static_cast<uint8_t>(token[size - 1])
+  );
+  XGRAMMAR_CHECK(accepted) << "A cached transition is not accepted by the parser";
+  row_cache_path_[size] = CacheLatestRow();
+  return row_cache_.row_infos[row_cache_path_[size]].history_row;
+}
+
+bool GrammarMatcher::Impl::AdvanceRowCachePath(const std::string& token, int size) {
+  const uint8_t byte = static_cast<uint8_t>(token[size]);
+  if (static_cast<int>(row_cache_path_.size()) < size + 2) {
+    row_cache_path_.resize(size + 2);
+  }
+  if (row_cache_.row_infos[row_cache_path_[size]].rejected_bytes.test(byte)) {
+    return false;
+  }
+  for (const auto& [accepted_byte, next_row] :
+       row_cache_.row_infos[row_cache_path_[size]].next_rows) {
+    if (accepted_byte == byte) {
+      row_cache_path_[size + 1] = next_row;
+      return true;
+    }
+  }
+  // Finding the history row can replace row_cache_path_[size] by an equivalent row.
+  const bool accepted = AdvanceFromRow(HistoryRowOfRowCachePath(token, size), byte);
+  const int32_t cached_row = row_cache_path_[size];
+  if (!accepted) {
+    row_cache_.row_infos[cached_row].rejected_bytes.set(byte);
+    return false;
+  }
+  row_cache_path_[size + 1] = CacheLatestRow();
+  row_cache_.row_infos[cached_row].next_rows.emplace_back(byte, row_cache_path_[size + 1]);
+  row_cache_.num_bytes += sizeof(std::pair<uint8_t, int32_t>);
+  return true;
+}
+
 void GrammarMatcher::Impl::FillBitmaskForStates(
     int32_t* bitmask_data_ptr, int index, bool skip_expired, bool debug_print
 ) {
@@ -2069,6 +2292,7 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
   }
 
   const auto& token_char_counts = tokenizer_info_.ImplPtr()->GetTokenCharCounts();
+  const bool use_row_cache = CanUseRowCache() && !debug_print;
   for (const auto& [state, adaptive_token_mask_pointer] : latest_states_with_masks) {
     if (adaptive_token_mask_pointer == nullptr) {
       continue;
@@ -2087,7 +2311,15 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
     tmp_rejected_indices_delta_.clear();
 
     // Examine only the current one ParserState
+    const auto& uncertain_indices = adaptive_token_mask.uncertain_indices;
+    const bool on_row_cache = use_row_cache && !uncertain_indices.empty();
+    if (on_row_cache) {
+      BeginRowCacheCheck();
+    }
     PushOneStateToCheck(state);
+    if (on_row_cache) {
+      row_cache_path_.assign(1, CacheLatestRow());
+    }
     bool track_temporary_input = has_char_budget_rules_ && has_budget_marker_rules_;
     int32_t saved_temporary_input_start_row = -1;
     std::string saved_temporary_input_bytes;
@@ -2105,7 +2337,6 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
                          << adaptive_token_mask.Print(tokenizer_info_);
     }
     int last_rejected_uncertain_range = 0;
-    const auto& uncertain_indices = adaptive_token_mask.uncertain_indices;
     for (auto token_it = uncertain_indices.begin(); token_it != uncertain_indices.end();) {
       const auto cur_token_idx = *token_it++;
       // Check if the current token is already accepted. If it is, we can skip it.
@@ -2144,6 +2375,8 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
         if (lcp_len > prev_matched_size) {
           last_rejected_uncertain_range = subtree_range[cur_token_idx];
           accepted = false;
+        } else if (lcp_len < prev_matched_size && on_row_cache) {
+          PopRowCacheRowsAfterPath(lcp_len);
         } else if (lcp_len < prev_matched_size) {
           PopLastStates(prev_matched_size - lcp_len);
           if (track_temporary_input) {
@@ -2156,7 +2389,8 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
       // Step 2.2. Find if the current token is accepted or rejected.
       if (accepted) {
         for (int j = prev_matched_size; j < static_cast<int>(cur_token.size()); ++j) {
-          bool byte_accepted = has_char_budget_rules_
+          bool byte_accepted = on_row_cache ? AdvanceRowCachePath(cur_token, j)
+                               : has_char_budget_rules_
                                    ? AdvanceWithCharacterBudget(static_cast<uint8_t>(cur_token[j]))
                                    : Advance(static_cast<uint8_t>(cur_token[j]));
           if (!byte_accepted) {
@@ -2226,7 +2460,11 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
       prev_token = retried_atomically ? nullptr : &cur_token;
     }
 
-    PopLastStates(prev_matched_size + 1);
+    if (on_row_cache) {
+      EndRowCacheCheck();
+    } else {
+      PopLastStates(prev_matched_size + 1);
+    }
     if (track_temporary_input) {
       temporary_input_start_row_ = saved_temporary_input_start_row;
       temporary_input_bytes_ = std::move(saved_temporary_input_bytes);
@@ -2411,6 +2649,10 @@ void GrammarMatcher::Impl::Rollback(int num_tokens) {
       accepted_bytes_.resize(row_byte_end_.back());
     }
     --num_tokens;
+  }
+  // The contexts of the popped rows do not describe the rows that will take their place.
+  if (row_cache_.context_of_row.size() > static_cast<size_t>(scanable_state_history_.size())) {
+    row_cache_.context_of_row.resize(scanable_state_history_.size());
   }
   budget_enforce_pending_ = false;
   budget_force_close_pending_ = false;

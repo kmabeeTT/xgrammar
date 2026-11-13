@@ -461,6 +461,9 @@ class EarleyParser {
   /*! \brief Whether any rule of the grammar has a token budget. */
   bool has_budget_rules_ = false;
 
+  /*! \brief Whether any rule of the grammar is lazy. */
+  bool has_lazy_rules_ = false;
+
   /*! \brief The number of Unicode codepoints accepted at every parser history row. */
   std::vector<int32_t> char_count_history_;
 
@@ -742,7 +745,15 @@ class EarleyParser {
    * \return True if the character is accepted, false otherwise.
    * \note If the character isn't accepted, then the states won't be changed.
    */
-  bool Advance(const uint8_t ch, bool debug_print = false);
+  bool Advance(const uint8_t ch, bool debug_print = false) {
+    return AdvanceFromRow(scanable_state_history_.size() - 1, ch, debug_print);
+  }
+
+  /*!
+   * \brief Advance from the states of history row `row` instead of the latest one. The new row
+   * is still appended at the end of the history.
+   */
+  bool AdvanceFromRow(int32_t row, const uint8_t ch, bool debug_print = false);
 
   /*!
    * \brief Remove the newly added states.
