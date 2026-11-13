@@ -2471,7 +2471,6 @@ void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
       }
       prev_matched_size = std::min(prev_matched_size, lcp_len);
     }
-    bool applied_run = false;
     if (accepted) {
       if (path.size() <= cur_token.size()) {
         path.resize(cur_token.size() + 1);
@@ -2485,52 +2484,9 @@ void GrammarMatcher::Impl::CheckUncertainTokensWithRowCache(
         }
         path[j + 1] = next;
         prev_matched_size = j + 1;
-        // A run is looked up, and collected, only where the path enters the nodes that existed
-        // before this check: the runs below it are covered by it.
-        if (store_rejected || next >= num_known_nodes || path[j] < num_known_nodes) {
-          continue;
-        }
-        // The uncertain tokens from this one on that share the first j + 1 bytes are a run. The
-        // list is sorted, so the run has kRowCacheMinRunTokens tokens if the last of them shares
-        // the prefix. A shorter run costs less to check than to store.
-        if (uncertain_indices.end() - token_it < kRowCacheMinRunTokens - 1) {
-          continue;
-        }
-        const auto& last_of_min_run =
-            sorted_decoded_vocab[*(token_it + (kRowCacheMinRunTokens - 2))].second;
-        if (static_cast<int>(last_of_min_run.size()) <= j ||
-            std::memcmp(last_of_min_run.data(), cur_token.data(), j + 1) != 0) {
-          continue;
-        }
-        if (const RowCacheRun* run =
-                FindRowCacheRun(next, list_pos, j + 1, &adaptive_token_mask)) {
-          apply_run(*run);
-          token_it = uncertain_indices.begin() + run->list_end;
-          applied_run = true;
-          break;
-        }
-        auto run_end = token_it;
-        for (; run_end != uncertain_indices.end(); ++run_end) {
-          const auto& token = sorted_decoded_vocab[*run_end].second;
-          if (static_cast<int>(token.size()) <= j ||
-              std::memcmp(token.data(), cur_token.data(), j + 1) != 0) {
-            break;
-          }
-        }
-        open_runs.push_back(
-            {next,
-             list_pos,
-             j + 1,
-             static_cast<int32_t>(run_end - uncertain_indices.begin()),
-             static_cast<int32_t>(run_accepted.size()),
-             true}
-        );
       }
     }
     prev_token = &cur_token;
-    if (applied_run) {
-      continue;
-    }
 
     if (store_rejected) {
       if (!accepted) {
