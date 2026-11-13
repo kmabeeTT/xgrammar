@@ -38,6 +38,7 @@ struct RowCache {
   static constexpr int32_t kFirstRowRef = -3;
   /*! \brief A cache that holds about this many bytes is emptied before the next check. */
   static constexpr size_t kMaxBytes = 4 << 20;
+  static constexpr size_t kMaxAcceptedUncertainTokens = 1 << 10;
   /*! \brief A check keeps the rows it pushed until it ends, unless they hold more states. */
   static constexpr int32_t kMaxTemporaryStates = 1 << 12;
   /*! \brief A row or context with more states gets an id of its own without being stored. */
@@ -51,6 +52,11 @@ struct RowCache {
     /*! \brief The history row that holds the states, if `check` is the running check. */
     int32_t history_row = -1;
     uint64_t check = 0;
+    /*! \brief For a row that holds one state: the ids of the uncertain tokens of the state's
+     * mask that the row accepts, once a check has covered all of them and found no more than
+     * kMaxAcceptedUncertainTokens. */
+    bool has_accepted_uncertain_tokens = false;
+    std::vector<int32_t> accepted_uncertain_tokens;
   };
 
   /*! \brief Stored form of a row -> its id. Ids are given in order of first appearance. */

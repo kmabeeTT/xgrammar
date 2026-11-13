@@ -2317,9 +2317,23 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
       BeginRowCacheCheck();
     }
     PushOneStateToCheck(state);
+    int32_t first_cached_row = -1;
     if (on_row_cache) {
-      row_cache_path_.assign(1, CacheLatestRow());
+      first_cached_row = CacheLatestRow();
+      row_cache_path_.assign(1, first_cached_row);
+      // The row holds this state alone, so the tokens it accepts are the same in every check.
+      if (adaptive_token_mask.store_type != StoreType::kRejected &&
+          row_cache_.row_infos[first_cached_row].has_accepted_uncertain_tokens) {
+        for (int32_t token_id : row_cache_.row_infos[first_cached_row].accepted_uncertain_tokens) {
+          accepted_bitset.Set(token_id, true);
+        }
+        EndRowCacheCheck();
+        continue;
+      }
     }
+    // The accepted uncertain tokens, collected to be kept with the cached row.
+    bool keep_result = on_row_cache && adaptive_token_mask.store_type != StoreType::kRejected;
+    std::vector<int32_t> accepted_uncertain_tokens;
     bool track_temporary_input = has_char_budget_rules_ && has_budget_marker_rules_;
     int32_t saved_temporary_input_start_row = -1;
     std::string saved_temporary_input_bytes;
@@ -2341,6 +2355,8 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
       const auto cur_token_idx = *token_it++;
       // Check if the current token is already accepted. If it is, we can skip it.
       if (accepted_bitset[sorted_decoded_vocab[cur_token_idx].first]) {
+        // The token may be one this state accepts too, so the result would miss it.
+        keep_result = false;
         continue;
       }
 
@@ -2449,6 +2465,9 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
           adaptive_token_mask.store_type == StoreType::kAccepted) {
         if (accepted) {
           accepted_bitset.Set(sorted_decoded_vocab[cur_token_idx].first, true);
+          if (keep_result) {
+            accepted_uncertain_tokens.push_back(sorted_decoded_vocab[cur_token_idx].first);
+          }
         }
       } else {
         if (!accepted) {
@@ -2462,6 +2481,13 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
 
     if (on_row_cache) {
       EndRowCacheCheck();
+      if (keep_result &&
+          accepted_uncertain_tokens.size() <= RowCache::kMaxAcceptedUncertainTokens) {
+        auto& info = row_cache_.row_infos[first_cached_row];
+        row_cache_.num_bytes += accepted_uncertain_tokens.size() * sizeof(int32_t);
+        info.accepted_uncertain_tokens = std::move(accepted_uncertain_tokens);
+        info.has_accepted_uncertain_tokens = true;
+      }
     } else {
       PopLastStates(prev_matched_size + 1);
     }
