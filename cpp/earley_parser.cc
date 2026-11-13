@@ -1187,20 +1187,20 @@ void EarleyParser::AdvanceCharacterClassStar(
 
 void EarleyParser::AdvanceFsm(const ParserState& state, const uint8_t ch) {
   XGRAMMAR_DCHECK(state.rule_id != -1 && grammar_->per_rule_fsms[state.rule_id].has_value());
-  const FSMEdge* edge;
-  const FSMEdge* edges_end;
-  {
-    const RuleFsmView& view = GetRuleFsmView(state.rule_id);
-    edge = view.edges + view.indptr[state.element_id];
-    edges_end = view.edges + view.indptr[state.element_id + 1];
-  }
+  // Neither the edges nor the flag storage move while scanning: they are sized per rule once.
+  const RuleFsmView& view = GetRuleFsmView(state.rule_id);
+  const FSMEdge* edge = view.edges + view.indptr[state.element_id];
+  const FSMEdge* const edges_end = view.edges + view.indptr[state.element_id + 1];
   for (; edge != edges_end; ++edge) {
     if ((!edge->IsCharRange()) || ch < edge->min || ch > edge->max) {
       continue;
     }
     auto new_state = state;
     new_state.element_id = edge->target;
-    const uint8_t flags = GetFsmStateFlags(state.rule_id, edge->target);
+    uint8_t flags = view.flags[edge->target];
+    if (flags == 0) {
+      flags = InitializeFsmStateFlags(state.rule_id, edge->target);
+    }
     if (!(flags & kFsmStateNonTerminal) && !(flags & kFsmStateEnd) && (flags & kFsmStateScanable)) {
       EnqueueWithoutProcessing(new_state);
     } else {
