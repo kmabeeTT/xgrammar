@@ -45,6 +45,8 @@ struct RowCache {
   static constexpr int32_t kMaxKeyStates = 64;
 
   struct RowInfo {
+    /*! \brief Whether the grammar can end at the row. */
+    bool completed = false;
     /*! \brief The bytes the row is known to reject. */
     std::bitset<256> rejected_bytes;
     /*! \brief The bytes the row is known to accept, with the id of the row after each. */

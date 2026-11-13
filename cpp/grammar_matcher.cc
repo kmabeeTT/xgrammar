@@ -898,6 +898,24 @@ bool GrammarMatcher::Impl::CanAcceptStopTokenAsTerminal(int32_t token_id) {
   if (token_id >= static_cast<int32_t>(decoded_vocab.size())) {
     return false;
   }
+  if (CanUseRowCache()) {
+    // Most rows reject the first byte. A row that takes it, such as one inside a string, tends
+    // to take the whole token on every mask, so the rest of the token is walked on cached rows.
+    const std::string& stop_token = decoded_vocab[token_id];
+    BeginRowCacheCheck();
+    if (stop_token.empty() || !Advance(static_cast<uint8_t>(stop_token[0]))) {
+      return false;
+    }
+    row_cache_path_.assign(2, CacheLatestRow());
+    size_t num_accepted = 1;
+    while (num_accepted < stop_token.size() && AdvanceRowCachePath(stop_token, num_accepted)) {
+      ++num_accepted;
+    }
+    const bool completed = num_accepted == stop_token.size() &&
+                           row_cache_.row_infos[row_cache_path_[num_accepted]].completed;
+    EndRowCacheCheck();
+    return completed;
+  }
   const bool atomic_success = AdvanceAtomicToken(token_id);
   if (atomic_success) {
     bool accepted = is_completed_.back();
@@ -2084,6 +2102,7 @@ int32_t GrammarMatcher::Impl::CacheLatestRow() {
   if (cached_row == -1) {
     cached_row = row_cache_.row_infos.size();
     row_cache_.row_infos.emplace_back();
+    row_cache_.row_infos.back().completed = is_completed_.back();
     row_cache_.num_bytes += sizeof(RowCache::RowInfo);
     if (store_key) {
       row_cache_.row_ids.emplace(tmp_row_cache_key_, cached_row);
