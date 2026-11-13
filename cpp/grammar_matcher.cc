@@ -481,7 +481,8 @@ class GrammarMatcher::Impl : public EarleyParser {
         stop_token_ids_(override_stop_tokens.value_or(tokenizer_info_.GetStopTokenIds())),
         terminate_without_stop_token_(terminate_without_stop_token),
         default_temperature_(default_temperature),
-        tmp_accepted_bitset_(tokenizer_info_.GetVocabSize()) {
+        tmp_accepted_bitset_(tokenizer_info_.GetVocabSize()),
+        row_cache_(compiled_grammar) {
     if (override_stop_tokens.has_value()) {
       XGRAMMAR_CHECK(!override_stop_tokens->empty())
           << "The override_stop_tokens should not be empty";
@@ -766,15 +767,21 @@ class GrammarMatcher::Impl : public EarleyParser {
 
   /*!
    * \brief The rows reached by the uncertain-token checks so far (see RowCache), with the
-   * matcher's view of its own history. A copy of the matcher starts with an empty cache.
+   * matcher's view of its own history. The cache is taken from the pool of the compiled grammar
+   * and returned to it at the end; a copy of the matcher takes a cache of its own.
    */
   struct MatcherRowCache : RowCache {
+    CompiledGrammar compiled_grammar;
     /*! \brief The context of each committed history row the cache has seen. */
     std::vector<int32_t> context_of_row;
 
-    MatcherRowCache() = default;
-    MatcherRowCache(const MatcherRowCache&) : RowCache() {}
+    explicit MatcherRowCache(CompiledGrammar compiled_grammar)
+        : RowCache(compiled_grammar->TakeRowCache()), compiled_grammar(compiled_grammar) {}
+    MatcherRowCache(const MatcherRowCache& other) : MatcherRowCache(other.compiled_grammar) {}
     MatcherRowCache& operator=(const MatcherRowCache&) = delete;
+    ~MatcherRowCache() {
+      compiled_grammar->ReturnRowCache(std::move(static_cast<RowCache&>(*this)));
+    }
   } row_cache_;
   /*! \brief The first temporary history row of the running check. */
   int32_t row_cache_base_row_ = 0;
