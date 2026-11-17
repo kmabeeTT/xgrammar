@@ -1206,6 +1206,9 @@ bool EarleyParser::AdvanceAtomicToken(
 ) {
   XGRAMMAR_DCHECK(tmp_process_state_queue_.empty())
       << "The tmp_process_state_queue_ should be empty before AdvanceAtomicToken.";
+  if (!grammar_->has_token_edges) {
+    return false;
+  }
   tmp_states_visited_in_queue_.Clear();
   tmp_states_to_be_added_.clear();
   tmp_accept_stop_token_ = false;
