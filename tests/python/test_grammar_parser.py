@@ -907,7 +907,7 @@ characters_item ::= (("\"") | ([^\"\\\0-\x1f] characters_item) | ("\\" escape ch
 escape ::= (([\"\\/bfnrt]) | ("u" [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9]))
 fraction ::= ("" | ("." [0-9] [0-9]*))
 exponent ::= ("" | ("e" sign [0-9] [0-9]*) | ("E" sign [0-9] [0-9]*))
-sign ::= ("" | ("+") | ("-"))
+sign ::= ("" | ("+") | ("-")) (=([0-9] [0-9]*))
 """
 
     grammar = xgr.Grammar.from_ebnf(before)
