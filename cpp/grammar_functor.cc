@@ -1446,8 +1446,10 @@ void GrammarFSMBuilderImpl::AddCharacterRange(int from, int to, uint32_t min, ui
 void GrammarFSMBuilderImpl::AddCodepointRange(int from, int to, uint32_t low, uint32_t high) {
   // Do not bridge UTF-8 widths with the packed-byte range helper: its historical minimum
   // byte sequences include overlong encodings (e.g. C0 80), which are not codepoints.
-  constexpr uint32_t width_ends[] = {0x7F, 0x7FF, 0xFFFF, 0x10FFFF};
+  // UTF-16 surrogates (U+D800-U+DFFF) are not codepoints UTF-8 may encode: split the 3-byte width around them.
+  constexpr uint32_t width_ends[] = {0x7F, 0x7FF, 0xD7FF, 0xFFFF, 0x10FFFF};
   for (uint32_t width_end : width_ends) {
+    if (low >= 0xD800 && low <= 0xDFFF) low = 0xE000;
     if (low <= high && low <= width_end) {
       auto end = std::min(high, width_end);
       AddCharacterRange(from, to, CodepointToPackedUTF8(low), CodepointToPackedUTF8(end));

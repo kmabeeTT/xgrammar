@@ -373,10 +373,20 @@ void AddCodepointRangesToFSM(
       fsm->AddEdge(from, to, low, std::min<uint32_t>(high, kMax1ByteUnicode));
     }
     if (high > kMax1ByteUnicode) {
+      // UTF-16 surrogates (U+D800-U+DFFF) are not codepoints UTF-8 may encode.
       uint32_t multi_byte_low = std::max<uint32_t>(low, kMax1ByteUnicode + 1);
-      AddPackedUTF8RangeEdges(
-          *fsm, from, to, CodepointToPackedUTF8(multi_byte_low), CodepointToPackedUTF8(high)
-      );
+      if (multi_byte_low < 0xD800) {
+        uint32_t end = std::min<uint32_t>(high, 0xD7FF);
+        AddPackedUTF8RangeEdges(
+            *fsm, from, to, CodepointToPackedUTF8(multi_byte_low), CodepointToPackedUTF8(end)
+        );
+      }
+      if (high > 0xDFFF) {
+        uint32_t start = std::max<uint32_t>(multi_byte_low, 0xE000);
+        AddPackedUTF8RangeEdges(
+            *fsm, from, to, CodepointToPackedUTF8(start), CodepointToPackedUTF8(high)
+        );
+      }
     }
   }
 }
